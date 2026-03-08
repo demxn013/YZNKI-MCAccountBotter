@@ -1,10 +1,57 @@
 // yazanaki/mcbot/botmanager.js
 // Manages all mineflayer bot instances for empire members.
 // Each Discord user can have at most ONE active bot at a time.
+//
+// AUTH NOTE:
+//   Uses Microsoft auth (online mode) so bots can join online-mode servers
+//   like DonutSMP. Tokens are cached per-username in ./tokens/<username>.json
+//   so users only need to complete the device-code flow once.
+//
+//   First run for a given username: the bot will emit a device code.
+//   Pass an `onDeviceCode(userCode, verificationUri)` callback to startBot()
+//   to surface this to the user (e.g. via Discord DM).
+//   After the user visits the URL and logs in, the token is saved automatically.
+//
+//   Subsequent runs: the cached token is used and refreshed silently.
 
 "use strict";
 
 const mineflayer = require("mineflayer");
+const fs = require("fs");
+const path = require("path");
+
+// ============================================================
+// TOKEN CACHE — persists Microsoft tokens between restarts
+// Stored at ./tokens/<username>.json  (lowercased)
+// ============================================================
+const TOKENS_DIR = path.join(__dirname, "tokens");
+
+if (!fs.existsSync(TOKENS_DIR)) {
+  fs.mkdirSync(TOKENS_DIR, { recursive: true });
+}
+
+function tokenPath(username) {
+  return path.join(TOKENS_DIR, `${username.toLowerCase()}.json`);
+}
+
+function loadToken(username) {
+  try {
+    const p = tokenPath(username);
+    if (!fs.existsSync(p)) return undefined;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function saveToken(username, token) {
+  try {
+    fs.writeFileSync(tokenPath(username), JSON.stringify(token, null, 2), "utf8");
+    console.log(`[botmanager] 💾 Token cached for ${username}`);
+  } catch (err) {
+    console.warn(`[botmanager] ⚠️ Could not save token for ${username}:`, err.message);
+  }
+}
 
 // ============================================================
 // IN-MEMORY BOT REGISTRY
@@ -22,7 +69,7 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 /**
  * Parse a Minecraft server address into host + port.
- * Handles formats: "play.server.net", "play.server.net:25565", "123.45.67.89:19132"
+ * Handles: "play.server.net", "play.server.net:25565", "1.2.3.4:19132"
  */
 function parseServerAddress(address) {
   const str = String(address || "").trim();
@@ -42,19 +89,25 @@ function parseServerAddress(address) {
 
 /**
  * Start a mineflayer bot for a specific empire member.
- * @param {string} discordId       - Discord user ID (used as unique key)
- * @param {string} minecraftUser   - Minecraft username from members.json
- * @param {string} serverAddress   - Target server (host[:port])
- * @param {string} version         - Minecraft version (e.g. "1.20.1")
- * @returns {{ success: boolean, reason?: string }}
+ * Uses Microsoft auth (online mode) to join online-mode servers.
+ *
+ * @param {string}   discordId       - Discord user ID (used as unique key)
+ * @param {string}   minecraftUser   - Minecraft username from members.json
+ * @param {string}   serverAddress   - Target server (host[:port])
+ * @param {string}   version         - Minecraft version (e.g. "1.20.1")
+ * @param {Function} [onDeviceCode]  - Optional callback(userCode, verificationUri)
+ *                                     called when Microsoft device-code auth is needed.
+ *                                     If not provided, the code is logged to console only.
+ * @returns {{ success: boolean, reason?: string, needsAuth?: boolean }}
  */
-function startBot(discordId, minecraftUser, serverAddress, version) {
+function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
   console.log(`  Discord ID:   ${discordId}`);
   console.log(`  MC User:      ${minecraftUser}`);
   console.log(`  Server:       ${serverAddress}`);
   console.log(`  Version:      ${version}`);
+  console.log(`  Auth mode:    microsoft`);
 
   // Check: already has a bot running
   if (activeBots.has(discordId)) {
@@ -73,6 +126,14 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
 
   const { host, port } = parseServerAddress(serverAddress);
 
+  // Load cached token if available
+  const cachedToken = loadToken(minecraftUser);
+  if (cachedToken) {
+    console.log(`[botmanager] 🔑 Using cached Microsoft token for ${minecraftUser}`);
+  } else {
+    console.log(`[botmanager] 🔑 No cached token for ${minecraftUser} — device code auth will be required`);
+  }
+
   let bot;
   try {
     bot = mineflayer.createBot({
@@ -80,9 +141,11 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
       port,
       username: minecraftUser,
       version: version || "1.20.1",
-      // Offline/cracked mode — no auth
-      auth: "offline",
-      // Prevent spam logging from mineflayer internals
+      // ✅ Microsoft auth — required for online-mode servers (DonutSMP etc.)
+      auth: "microsoft",
+      // Provide cached token if we have one so we don't need device code again
+      ...(cachedToken ? { profilesFolder: TOKENS_DIR } : {}),
+      // Suppress internal mineflayer spam
       hideErrors: false,
       logErrors: true,
     });
@@ -106,6 +169,30 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
   activeBots.set(discordId, entry);
 
   // ============================================================
+  // MICROSOFT DEVICE CODE EVENT
+  // Fires when there's no cached token and the user needs to authenticate.
+  // The user visits https://microsoft.com/link and enters the code.
+  // After login, the token is cached automatically for future use.
+  // ============================================================
+  bot.on("microsoft_device_code", (deviceCodeResponse) => {
+    const userCode = deviceCodeResponse.user_code;
+    const verificationUri = deviceCodeResponse.verification_uri || "https://microsoft.com/link";
+    const expiresIn = deviceCodeResponse.expires_in || 900;
+
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log(`[botmanager] 🔐 Microsoft auth required for ${minecraftUser}`);
+    console.log(`[botmanager] 🌐 Go to: ${verificationUri}`);
+    console.log(`[botmanager] 🔑 Enter code: ${userCode}`);
+    console.log(`[botmanager] ⏰ Expires in: ${Math.floor(expiresIn / 60)} minutes`);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Surface device code to Discord bot if callback provided
+    if (typeof onDeviceCode === "function") {
+      onDeviceCode(userCode, verificationUri, expiresIn);
+    }
+  });
+
+  // ============================================================
   // BOT EVENTS
   // ============================================================
 
@@ -114,12 +201,27 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
     if (activeBots.has(discordId)) {
       activeBots.get(discordId).status = "online";
     }
+
+    // Save/refresh token after successful login
+    try {
+      const profilesFile = path.join(TOKENS_DIR, "nmp-cache.json");
+      if (fs.existsSync(profilesFile)) {
+        const profiles = JSON.parse(fs.readFileSync(profilesFile, "utf8"));
+        const userKey = Object.keys(profiles).find(
+          k => k.toLowerCase() === minecraftUser.toLowerCase()
+        );
+        if (userKey) {
+          saveToken(minecraftUser, profiles[userKey]);
+        }
+      }
+    } catch {
+      // Non-fatal — token caching is best-effort
+    }
   });
 
   bot.on("kicked", (reason) => {
     let reasonText = reason;
     try {
-      // reason may be a JSON chat component
       const parsed = JSON.parse(reason);
       reasonText = parsed.text || parsed.translate || reason;
     } catch (_) {}
@@ -129,6 +231,16 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
 
   bot.on("error", (err) => {
     console.error(`[botmanager] ❌ Bot error: ${minecraftUser} — ${err.message}`);
+    // If it's an auth error, remove the cached token so next attempt re-auths
+    if (
+      err.message?.toLowerCase().includes("microsoft") ||
+      err.message?.toLowerCase().includes("auth") ||
+      err.message?.toLowerCase().includes("token") ||
+      err.message?.toLowerCase().includes("session")
+    ) {
+      console.warn(`[botmanager] 🔑 Auth error detected — clearing cached token for ${minecraftUser}`);
+      try { fs.unlinkSync(tokenPath(minecraftUser)); } catch {}
+    }
     cleanupBot(discordId, "error");
   });
 
@@ -139,10 +251,9 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
       console.log(`[botmanager] 🔄 Auto-reconnect in ${RECONNECT_DELAY_MS}ms for ${minecraftUser}...`);
       activeBots.get(discordId).status = "reconnecting";
       setTimeout(() => {
-        // Only reconnect if the user hasn't manually stopped the bot
         if (activeBots.has(discordId) && activeBots.get(discordId).status === "reconnecting") {
           cleanupBot(discordId, "reconnect_cycle");
-          const result = startBot(discordId, minecraftUser, `${host}:${port}`, version);
+          const result = startBot(discordId, minecraftUser, `${host}:${port}`, version, onDeviceCode);
           if (!result.success) {
             console.error(`[botmanager] ❌ Auto-reconnect failed for ${minecraftUser}: ${result.reason}`);
           }
@@ -169,26 +280,19 @@ function startBot(discordId, minecraftUser, serverAddress, version) {
  */
 function stopBot(discordId) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log(`[botmanager] 🛑 Stopping bot for Discord ID: ${discordId}`);
+  console.log(`[botmanager] 🛑 Stopping bot for discordId: ${discordId}`);
 
-  if (!activeBots.has(discordId)) {
-    console.warn(`[botmanager] ⚠️ No active bot found for ${discordId}`);
+  const entry = activeBots.get(discordId);
+  if (!entry) {
+    console.warn(`[botmanager] ⚠️ No bot running for ${discordId}`);
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "no_bot_running" };
   }
 
-  const entry = activeBots.get(discordId);
-  try {
-    entry.bot.quit("Stopped by Yazanaki command");
-  } catch (err) {
-    // Bot may already be disconnected; still clean up registry
-    console.warn(`[botmanager] ⚠️ Error quitting bot (may already be disconnected): ${err.message}`);
-  }
-
   cleanupBot(discordId, "manual_stop");
-  console.log(`[botmanager] ✅ Bot stopped: ${entry.minecraftUser}`);
+  console.log(`[botmanager] ✅ Bot stopped for ${entry.minecraftUser}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-  return { success: true, minecraftUser: entry.minecraftUser };
+  return { success: true };
 }
 
 // ============================================================
@@ -196,26 +300,37 @@ function stopBot(discordId) {
 // ============================================================
 
 /**
- * Emergency stop — kills every active bot.
- * @returns {{ stopped: number }}
+ * Stop all running bots.
+ * @returns {{ success: boolean, stopped: number }}
  */
 function stopAllBots() {
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log(`[botmanager] 🚨 STOP ALL — Killing ${activeBots.size} bot(s)`);
-
-  let stopped = 0;
-  for (const [discordId, entry] of activeBots.entries()) {
-    try {
-      entry.bot.quit("Emergency stop by admin");
-    } catch (_) {}
-    activeBots.delete(discordId);
-    stopped++;
-    console.log(`[botmanager] 🛑 Stopped: ${entry.minecraftUser} (${discordId})`);
+  const count = activeBots.size;
+  console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
+  for (const discordId of [...activeBots.keys()]) {
+    cleanupBot(discordId, "stopall");
   }
+  return { success: true, stopped: count };
+}
 
-  console.log(`[botmanager] ✅ All bots stopped (${stopped} total)`);
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-  return { stopped };
+// ============================================================
+// CLEANUP (internal)
+// ============================================================
+
+function cleanupBot(discordId, reason) {
+  const entry = activeBots.get(discordId);
+  if (!entry) return;
+
+  activeBots.delete(discordId);
+
+  try {
+    entry.bot.quit();
+  } catch (_) {}
+
+  try {
+    entry.bot.end();
+  } catch (_) {}
+
+  console.log(`[botmanager] 🧹 Cleaned up bot for ${entry.minecraftUser} (reason: ${reason})`);
 }
 
 // ============================================================
@@ -225,12 +340,33 @@ function stopAllBots() {
 /**
  * Get status of a specific user's bot.
  * @param {string} discordId
- * @returns {object|null}
+ * @returns {{ found: boolean, bot?: object }}
  */
 function getBotStatus(discordId) {
-  if (!activeBots.has(discordId)) return null;
   const entry = activeBots.get(discordId);
+  if (!entry) return { found: false };
+
   return {
+    found: true,
+    bot: {
+      discordId: entry.discordId,
+      minecraftUser: entry.minecraftUser,
+      serverHost: entry.serverHost,
+      serverPort: entry.serverPort,
+      version: entry.version,
+      startedAt: entry.startedAt,
+      status: entry.status,
+      uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+    },
+  };
+}
+
+/**
+ * List all active bots.
+ * @returns {Array<object>}
+ */
+function listAllBots() {
+  return [...activeBots.values()].map((entry) => ({
     discordId: entry.discordId,
     minecraftUser: entry.minecraftUser,
     serverHost: entry.serverHost,
@@ -239,47 +375,15 @@ function getBotStatus(discordId) {
     startedAt: entry.startedAt,
     status: entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
-  };
+  }));
 }
 
 /**
- * List all active bots (for admin use).
- * @returns {Array}
- */
-function listAllBots() {
-  const result = [];
-  for (const discordId of activeBots.keys()) {
-    result.push(getBotStatus(discordId));
-  }
-  return result;
-}
-
-/**
- * Total count of active bots.
+ * Get total number of active bots.
+ * @returns {number}
  */
 function getBotCount() {
   return activeBots.size;
-}
-
-// ============================================================
-// INTERNAL CLEANUP
-// ============================================================
-
-/**
- * Remove a bot entry from the registry (does NOT quit the bot connection — do that first).
- * @param {string} discordId
- * @param {string} reason - for logging
- */
-function cleanupBot(discordId, reason) {
-  if (activeBots.has(discordId)) {
-    // Remove all listeners to prevent memory leaks
-    try {
-      const entry = activeBots.get(discordId);
-      entry.bot.removeAllListeners();
-    } catch (_) {}
-    activeBots.delete(discordId);
-    console.log(`[botmanager] 🧹 Cleaned up bot entry for ${discordId} (reason: ${reason})`);
-  }
 }
 
 module.exports = {

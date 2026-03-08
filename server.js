@@ -7,6 +7,12 @@
 //   Authorization header keeps out random users, but traffic is unencrypted.
 //   For hardened security, restrict this port to KenzAI's bot server IP
 //   using a firewall rule (e.g. ufw allow from <KENZAI_IP> to any port <PORT>)
+//
+// MICROSOFT AUTH:
+//   When a user's Microsoft token is not yet cached, mineflayer will emit a
+//   device code. This server stores it in a pendingDeviceCodes map so the
+//   Discord bot can poll GET /devicecode/:discordId and DM the user the link.
+//   Once the user completes auth, the token is cached and future starts are silent.
 
 "use strict";
 
@@ -32,6 +38,14 @@ if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM
   console.error("❌ FATAL: API_KEY is not set in .env. Refusing to start.");
   process.exit(1);
 }
+
+// ============================================================
+// PENDING DEVICE CODES
+// Stores device codes emitted during Microsoft auth so the
+// Discord bot can poll for them and DM the user.
+// Map<discordId, { userCode, verificationUri, expiresAt }>
+// ============================================================
+const pendingDeviceCodes = new Map();
 
 // ============================================================
 // MIDDLEWARE — API Key Auth
@@ -66,6 +80,11 @@ app.get("/ping", (req, res) => {
 // ROUTE: Start Bot
 // POST /start
 // Body: { discordId, minecraftUser, serverAddress, version }
+//
+// If Microsoft auth is needed (no cached token), the device code
+// is stored in pendingDeviceCodes. The Discord bot should poll
+// GET /devicecode/:discordId after receiving a 200 here to check
+// if auth is required, then DM the user the verification link.
 // ============================================================
 
 app.post("/start", (req, res) => {
@@ -84,11 +103,19 @@ app.post("/start", (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid serverAddress" });
   }
 
+  // Device code callback — stores the code so Discord bot can poll for it
+  const onDeviceCode = (userCode, verificationUri, expiresIn) => {
+    const expiresAt = Date.now() + (expiresIn * 1000);
+    pendingDeviceCodes.set(discordId.trim(), { userCode, verificationUri, expiresAt });
+    console.log(`[server] 🔐 Device code stored for ${discordId}: ${userCode} @ ${verificationUri}`);
+  };
+
   const result = startBot(
     discordId.trim(),
     minecraftUser.trim(),
     serverAddress.trim(),
-    (version || "1.20.1").trim()
+    (version || "1.20.1").trim(),
+    onDeviceCode
   );
 
   if (!result.success) {
@@ -97,6 +124,50 @@ app.post("/start", (req, res) => {
   }
 
   return res.status(200).json({ ok: true, message: "Bot started", discordId, minecraftUser });
+});
+
+// ============================================================
+// ROUTE: Check for Pending Device Code
+// GET /devicecode/:discordId
+//
+// Returns the Microsoft device code if one is pending for this user.
+// The Discord bot polls this after /start to check if auth is needed.
+// Returns 404 if no code is pending (either not needed or already done).
+// ============================================================
+
+app.get("/devicecode/:discordId", (req, res) => {
+  const { discordId } = req.params;
+
+  const entry = pendingDeviceCodes.get(discordId.trim());
+
+  if (!entry) {
+    return res.status(404).json({ ok: false, pending: false });
+  }
+
+  // Clean up expired codes
+  if (Date.now() > entry.expiresAt) {
+    pendingDeviceCodes.delete(discordId.trim());
+    return res.status(404).json({ ok: false, pending: false, reason: "expired" });
+  }
+
+  return res.status(200).json({
+    ok: true,
+    pending: true,
+    userCode: entry.userCode,
+    verificationUri: entry.verificationUri,
+    expiresAt: entry.expiresAt,
+  });
+});
+
+// ============================================================
+// ROUTE: Clear Device Code (after user has completed auth)
+// DELETE /devicecode/:discordId
+// ============================================================
+
+app.delete("/devicecode/:discordId", (req, res) => {
+  const { discordId } = req.params;
+  pendingDeviceCodes.delete(discordId.trim());
+  return res.status(200).json({ ok: true });
 });
 
 // ============================================================
@@ -135,11 +206,11 @@ app.get("/status/:discordId", (req, res) => {
 
   const status = getBotStatus(discordId.trim());
 
-  if (!status) {
-    return res.status(404).json({ ok: false, error: "No active bot for this user", discordId });
+  if (!status.found) {
+    return res.status(404).json({ ok: false, reason: "no_bot_running", discordId });
   }
 
-  return res.status(200).json({ ok: true, bot: status });
+  return res.status(200).json({ ok: true, bot: status.bot });
 });
 
 // ============================================================
@@ -172,6 +243,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[server] ✅ Yazanaki MCBot API running on port ${PORT}`);
   console.log(`[server] 🔐 API key auth: ENABLED`);
+  console.log(`[server] 🔑 Auth mode: Microsoft (online mode)`);
   console.log(`[server] 🤖 Max bots: ${process.env.MAX_BOTS || "unlimited"}`);
   console.log(`[server] 🔄 Auto-reconnect: ${process.env.AUTO_RECONNECT || "false"}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
