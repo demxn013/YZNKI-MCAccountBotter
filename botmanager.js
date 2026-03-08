@@ -165,8 +165,22 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     version: version || "1.20.1",
     startedAt: new Date().toISOString(),
     status: "connecting",
+    spawnError: null,
   };
   activeBots.set(discordId, entry);
+
+  // Spawn timeout — if bot doesn't fire "spawn" within 45s, mark as failed and clean up.
+  // This covers silent rejections (wrong version, server kick before spawn, auth issues).
+  const spawnTimeoutId = setTimeout(() => {
+    if (!activeBots.has(discordId)) return;
+    const e = activeBots.get(discordId);
+    if (e.status !== "connecting") return; // already spawned or failed via error event
+    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 45s — cleaning up`);
+    e.spawnError = "Connection timed out — the server did not respond within 45 seconds. Check the server address and version.";
+    e.status = "error";
+    // Keep entry briefly so Discord bot can poll the error, then clean up
+    setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
+  }, 45000);
 
   // ============================================================
   // MICROSOFT DEVICE CODE EVENT
@@ -197,9 +211,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   // ============================================================
 
   bot.once("spawn", () => {
+    clearTimeout(spawnTimeoutId);
     console.log(`[botmanager] ✅ Bot spawned: ${minecraftUser} on ${host}:${port}`);
     if (activeBots.has(discordId)) {
       activeBots.get(discordId).status = "online";
+      activeBots.get(discordId).spawnError = null;
     }
 
     // Save/refresh token after successful login
@@ -220,17 +236,27 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   });
 
   bot.on("kicked", (reason) => {
+    clearTimeout(spawnTimeoutId);
     let reasonText = reason;
     try {
       const parsed = JSON.parse(reason);
       reasonText = parsed.text || parsed.translate || reason;
     } catch (_) {}
     console.warn(`[botmanager] 🦶 Bot kicked: ${minecraftUser} — ${reasonText}`);
-    cleanupBot(discordId, "kicked");
+    if (activeBots.has(discordId)) {
+      activeBots.get(discordId).spawnError = `Kicked: ${reasonText}`;
+      activeBots.get(discordId).status = "error";
+    }
+    setTimeout(() => cleanupBot(discordId, "kicked"), 30000);
   });
 
   bot.on("error", (err) => {
+    clearTimeout(spawnTimeoutId);
     console.error(`[botmanager] ❌ Bot error: ${minecraftUser} — ${err.message}`);
+    if (activeBots.has(discordId)) {
+      activeBots.get(discordId).spawnError = err.message;
+      activeBots.get(discordId).status = "error";
+    }
     // If it's an auth error, remove the cached token so next attempt re-auths
     if (
       err.message?.toLowerCase().includes("microsoft") ||
@@ -241,10 +267,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       console.warn(`[botmanager] 🔑 Auth error detected — clearing cached token for ${minecraftUser}`);
       try { fs.unlinkSync(tokenPath(minecraftUser)); } catch {}
     }
-    cleanupBot(discordId, "error");
+    setTimeout(() => cleanupBot(discordId, "error"), 30000);
   });
 
   bot.on("end", (reason) => {
+    clearTimeout(spawnTimeoutId);
     console.log(`[botmanager] 🔌 Bot disconnected: ${minecraftUser} — reason: ${reason}`);
 
     if (AUTO_RECONNECT && activeBots.has(discordId)) {
@@ -356,6 +383,7 @@ function getBotStatus(discordId) {
       version: entry.version,
       startedAt: entry.startedAt,
       status: entry.status,
+      spawnError: entry.spawnError || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
     },
   };
