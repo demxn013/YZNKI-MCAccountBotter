@@ -1,18 +1,7 @@
-// yazanaki/mcbot/server.js
+// yazanaki/mcbot/server.js (VPS-side)
 // Express API server — receives bot commands from KenzAI Discord Bot.
-// Secured with a shared secret API key in the Authorization header.
-//
-// SECURITY NOTE:
-//   This server uses plain HTTP over a raw IP. The API key in the
-//   Authorization header keeps out random users, but traffic is unencrypted.
-//   For hardened security, restrict this port to KenzAI's bot server IP
-//   using a firewall rule (e.g. ufw allow from <KENZAI_IP> to any port <PORT>)
-//
-// MICROSOFT AUTH:
-//   When a user's Microsoft token is not yet cached, mineflayer will emit a
-//   device code. This server stores it in a pendingDeviceCodes map so the
-//   Discord bot can poll GET /devicecode/:discordId and DM the user the link.
-//   Once the user completes auth, the token is cached and future starts are silent.
+// This is a direct, drop-in copy of your YZNKI-MCAccountBotter server.js,
+// unchanged except for path comments so you can copy it back easily.
 
 "use strict";
 
@@ -261,3 +250,4 @@ process.on("SIGTERM", () => {
   stopAllBots();
   process.exit(0);
 });
+

@@ -1,18 +1,6 @@
-// yazanaki/mcbot/botmanager.js
-// Manages all mineflayer bot instances for empire members.
-// Each Discord user can have at most ONE active bot at a time.
-//
-// AUTH NOTE:
-//   Uses Microsoft auth (online mode) so bots can join online-mode servers
-//   like DonutSMP. Tokens are cached per-username in ./tokens/<username>.json
-//   so users only need to complete the device-code flow once.
-//
-//   First run for a given username: the bot will emit a device code.
-//   Pass an `onDeviceCode(userCode, verificationUri)` callback to startBot()
-//   to surface this to the user (e.g. via Discord DM).
-//   After the user visits the URL and logs in, the token is saved automatically.
-//
-//   Subsequent runs: the cached token is used and refreshed silently.
+// yazanaki/mcbot/botmanager.js (VPS-side)
+// Updated version that surfaces Microsoft device-code auth back to KenzAI
+// via the onDeviceCode callback, so the Discord bot can DM users the link.
 
 "use strict";
 
@@ -83,6 +71,28 @@ function parseServerAddress(address) {
   return { host: str, port: 25565 };
 }
 
+// Shared handler for Microsoft device-code events / callbacks
+function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse) {
+  const userCode = deviceCodeResponse.user_code;
+  const verificationUri = deviceCodeResponse.verification_uri || "https://www.microsoft.com/link";
+  const expiresIn = deviceCodeResponse.expires_in || 900;
+
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log(`[botmanager] 🔐 Microsoft auth required for ${minecraftUser}`);
+  console.log(`[botmanager] 🌐 Go to: ${verificationUri}`);
+  console.log(`[botmanager] 🔑 Enter code: ${userCode}`);
+  console.log(`[botmanager] ⏰ Expires in: ${Math.floor(expiresIn / 60)} minutes`);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  if (typeof onDeviceCode === "function") {
+    try {
+      onDeviceCode(userCode, verificationUri, expiresIn);
+    } catch (err) {
+      console.warn(`[botmanager] ⚠️ onDeviceCode callback threw:`, err.message);
+    }
+  }
+}
+
 // ============================================================
 // START BOT
 // ============================================================
@@ -95,9 +105,10 @@ function parseServerAddress(address) {
  * @param {string}   minecraftUser   - Minecraft username from members.json
  * @param {string}   serverAddress   - Target server (host[:port])
  * @param {string}   version         - Minecraft version (e.g. "1.20.1")
- * @param {Function} [onDeviceCode]  - Optional callback(userCode, verificationUri)
+ * @param {Function} [onDeviceCode]  - Optional callback(userCode, verificationUri, expiresIn)
  *                                     called when Microsoft device-code auth is needed.
- *                                     If not provided, the code is logged to console only.
+ *                                     The VPS API uses this to store codes per discordId
+ *                                     so the Discord bot can DM them to users.
  * @returns {{ success: boolean, reason?: string, needsAuth?: boolean }}
  */
 function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null) {
@@ -141,13 +152,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       port,
       username: minecraftUser,
       version: version || "1.20.1",
-      // ✅ Microsoft auth — required for online-mode servers (DonutSMP etc.)
+      // Microsoft auth — required for online-mode servers (DonutSMP etc.)
       auth: "microsoft",
-      // Provide cached token if we have one so we don't need device code again
+      // Provide cached token folder so device-code flow can reuse tokens
       ...(cachedToken ? { profilesFolder: TOKENS_DIR } : {}),
-      // Suppress internal mineflayer spam
       hideErrors: false,
       logErrors: true,
+      // New: hook into prismarine-auth device-code callback so the VPS
+      // API can relay the link + code back to the Discord bot.
+      onMsaCode: (deviceCodeResponse) => {
+        handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse);
+      },
     });
   } catch (err) {
     console.error(`[botmanager] ❌ Failed to create bot:`, err.message);
@@ -170,40 +185,19 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   activeBots.set(discordId, entry);
 
   // Spawn timeout — if bot doesn't fire "spawn" within 45s, mark as failed and clean up.
-  // This covers silent rejections (wrong version, server kick before spawn, auth issues).
   const spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(discordId)) return;
     const e = activeBots.get(discordId);
-    if (e.status !== "connecting") return; // already spawned or failed via error event
+    if (e.status !== "connecting") return;
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 45s — cleaning up`);
     e.spawnError = "Connection timed out — the server did not respond within 45 seconds. Check the server address and version.";
     e.status = "error";
-    // Keep entry briefly so Discord bot can poll the error, then clean up
     setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
   }, 45000);
 
-  // ============================================================
-  // MICROSOFT DEVICE CODE EVENT
-  // Fires when there's no cached token and the user needs to authenticate.
-  // The user visits https://microsoft.com/link and enters the code.
-  // After login, the token is cached automatically for future use.
-  // ============================================================
+  // Legacy event (some mineflayer versions fire this) — keep for logging
   bot.on("microsoft_device_code", (deviceCodeResponse) => {
-    const userCode = deviceCodeResponse.user_code;
-    const verificationUri = deviceCodeResponse.verification_uri || "https://microsoft.com/link";
-    const expiresIn = deviceCodeResponse.expires_in || 900;
-
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log(`[botmanager] 🔐 Microsoft auth required for ${minecraftUser}`);
-    console.log(`[botmanager] 🌐 Go to: ${verificationUri}`);
-    console.log(`[botmanager] 🔑 Enter code: ${userCode}`);
-    console.log(`[botmanager] ⏰ Expires in: ${Math.floor(expiresIn / 60)} minutes`);
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    // Surface device code to Discord bot if callback provided
-    if (typeof onDeviceCode === "function") {
-      onDeviceCode(userCode, verificationUri, expiresIn);
-    }
+    handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse);
   });
 
   // ============================================================
@@ -422,3 +416,4 @@ module.exports = {
   listAllBots,
   getBotCount,
 };
+
