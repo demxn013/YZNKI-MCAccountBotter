@@ -231,11 +231,27 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   bot.on("kicked", (reason) => {
     clearTimeout(spawnTimeoutId);
-    let reasonText = reason;
-    try {
-      const parsed = JSON.parse(reason);
-      reasonText = parsed.text || parsed.translate || reason;
-    } catch (_) {}
+    let reasonText;
+
+    if (typeof reason === "string") {
+      // Newer servers often send a JSON string, older ones plain text
+      try {
+        const parsed = JSON.parse(reason);
+        reasonText = parsed.text || parsed.translate || reason;
+      } catch {
+        reasonText = reason;
+      }
+    } else if (reason && typeof reason === "object") {
+      // Mineflayer/node-minecraft-protocol sometimes pass a rich object
+      reasonText =
+        reason.text ||
+        reason.translate ||
+        reason.reason ||
+        JSON.stringify(reason);
+    } else {
+      reasonText = String(reason);
+    }
+
     console.warn(`[botmanager] 🦶 Bot kicked: ${minecraftUser} — ${reasonText}`);
     if (activeBots.has(discordId)) {
       activeBots.get(discordId).spawnError = `Kicked: ${reasonText}`;
