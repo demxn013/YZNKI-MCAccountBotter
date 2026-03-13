@@ -12,21 +12,50 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
-    super("donutsmp", ["1.21.11"]);
+    super("donutsmp", ["1.20.4", "1.20.1"]);
     this._lastMoveAt = 0;
+    this._versionCache = new Map(); // hostLower -> version
   }
 
-  buildClientOptions(baseOptions) {
+  _getCandidates() {
+    return ["1.20.4", "1.20.1", "1.19.4"];
+  }
+
+  _resolveAutoVersion(hostLower) {
+    return this._versionCache.get(hostLower) || this._getCandidates()[0];
+  }
+
+  buildClientOptions(baseOptions, session) {
+    const requestedVersion = String(baseOptions.version || "auto").toLowerCase();
+    const hostLower = String(baseOptions.host || "").toLowerCase();
+
+    const effectiveVersion =
+      requestedVersion === "auto" ? this._resolveAutoVersion(hostLower) : baseOptions.version;
+
+    // Expose on session for status/debug
+    if (session) {
+      session.version = effectiveVersion;
+    }
+
     return {
       ...baseOptions,
+      version: effectiveVersion,
       brand: "vanilla",
     };
   }
 
-  attachHandlers(client, _session) {
+  attachHandlers(client, session) {
     // Placeholder for handling DonutSMP-specific plugin channels.
     client.on("plugin_message", () => {
       // In a future iteration, inspect and respond to channels used by DonutSMP.
+    });
+
+    // If we successfully log in, cache the working version (best-effort, in-memory).
+    client.on("login", () => {
+      const hostLower = String(session?.serverHost || "").toLowerCase();
+      if (hostLower) {
+        this._versionCache.set(hostLower, String(session?.version || "1.20.4"));
+      }
     });
   }
 

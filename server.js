@@ -103,7 +103,7 @@ app.post("/start", (req, res) => {
     discordId.trim(),
     minecraftUser.trim(),
     serverAddress.trim(),
-    (version || "1.21.11").trim(),
+    (version || "1.21.8").trim(),
     onDeviceCode
   );
 

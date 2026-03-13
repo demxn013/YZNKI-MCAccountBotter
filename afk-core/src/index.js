@@ -75,7 +75,7 @@ fastify.post("/session/start", async (request, reply) => {
     minecraftUser: String(body.minecraftUser),
     serverHost: String(body.serverHost),
     serverPort: body.serverPort ? Number(body.serverPort) : 25565,
-    version: body.version ? String(body.version) : "1.20.1",
+    version: body.version ? String(body.version) : "1.21.8",
     profile,
     authHandle:
       body.authHandle || {

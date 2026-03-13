@@ -52,6 +52,58 @@ const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
+// VERSION CACHE (best-effort)
+// Keeps track of which protocol version worked per host.
+// ============================================================
+const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
+/** @type {Map<string, string>} */
+const versionCache = new Map();
+
+function loadVersionCache() {
+  try {
+    if (!fs.existsSync(VERSION_CACHE_PATH)) return;
+    const raw = fs.readFileSync(VERSION_CACHE_PATH, "utf8");
+    const json = JSON.parse(raw);
+    for (const [host, ver] of Object.entries(json || {})) {
+      if (typeof host === "string" && typeof ver === "string") {
+        versionCache.set(host.toLowerCase(), ver);
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function saveVersionCache() {
+  try {
+    const obj = Object.fromEntries(versionCache.entries());
+    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch {
+    // ignore
+  }
+}
+
+loadVersionCache();
+
+function getAutoCandidatesForHost(hostLower) {
+  // Keep this list short and curated; order matters.
+  if (hostLower === "donutsmp.net" || hostLower.endsWith(".donutsmp.net")) {
+    return ["1.20.4", "1.20.1", "1.19.4"];
+  }
+  // Generic fallback: prefer newer stable versions you expect to work.
+  return ["1.20.4", "1.20.1"];
+}
+
+function shouldRotateVersionForReason(text) {
+  const lower = String(text || "").toLowerCase();
+  return (
+    lower.includes("chunk size is") ||
+    lower.includes("partial packet") ||
+    lower.includes("invalid sequence")
+  );
+}
+
+// ============================================================
 // HELPERS
 // ============================================================
 
@@ -136,6 +188,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   }
 
   const { host, port } = parseServerAddress(serverAddress);
+  const hostLower = String(host || "").toLowerCase();
+  const requestedVersion = (version || "1.21.8").trim();
+  const autoMode = requestedVersion.toLowerCase() === "auto";
+  const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
+  const cached = autoMode ? versionCache.get(hostLower) : null;
+  let effectiveVersion = autoMode ? (cached || autoCandidates[0] || "1.20.4") : requestedVersion;
 
   // Load cached token if available
   const cachedToken = loadToken(minecraftUser);
@@ -151,7 +209,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       host,
       port,
       username: minecraftUser,
-      version: version || "1.21.11",
+      version: effectiveVersion,
       // Microsoft auth — required for online-mode servers (DonutSMP etc.)
       auth: "microsoft",
       // Provide cached token folder so device-code flow can reuse tokens
@@ -177,7 +235,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     minecraftUser,
     serverHost: host,
     serverPort: port,
-    version: version || "1.21.11",
+    version: effectiveVersion,
+    requestedVersion,
+    autoMode,
+    autoCandidates,
+    autoCandidateIndex: autoMode ? Math.max(0, autoCandidates.indexOf(effectiveVersion)) : -1,
     startedAt: new Date().toISOString(),
     status: "connecting",
     spawnError: null,
@@ -210,6 +272,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     if (activeBots.has(discordId)) {
       activeBots.get(discordId).status = "online";
       activeBots.get(discordId).spawnError = null;
+    }
+
+    // Cache the working version for this host (auto-mode only).
+    if (autoMode) {
+      versionCache.set(hostLower, effectiveVersion);
+      saveVersionCache();
     }
 
     // Save/refresh token after successful login
@@ -257,6 +325,27 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       activeBots.get(discordId).spawnError = `Kicked: ${reasonText}`;
       activeBots.get(discordId).status = "error";
     }
+
+    // Auto version rotation for protocol/decoder desync
+    if (autoMode && shouldRotateVersionForReason(reasonText)) {
+      const e = activeBots.get(discordId);
+      const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
+      const nextVersion = e?.autoCandidates?.[nextIndex];
+      if (nextVersion) {
+        console.warn(
+          `[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`,
+        );
+        setTimeout(() => {
+          cleanupBot(discordId, "auto_version_retry_kicked");
+          // rotate to next candidate explicitly to avoid repeating cached version
+          versionCache.set(hostLower, nextVersion);
+          saveVersionCache();
+          startBot(discordId, minecraftUser, `${host}:${port}`, "auto", onDeviceCode);
+        }, 1500);
+        return;
+      }
+    }
+
     setTimeout(() => cleanupBot(discordId, "kicked"), 30000);
   });
 
@@ -266,6 +355,25 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     if (activeBots.has(discordId)) {
       activeBots.get(discordId).spawnError = err.message;
       activeBots.get(discordId).status = "error";
+    }
+
+    // Auto version rotation for protocol/decoder desync
+    if (autoMode && shouldRotateVersionForReason(err.message)) {
+      const e = activeBots.get(discordId);
+      const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
+      const nextVersion = e?.autoCandidates?.[nextIndex];
+      if (nextVersion) {
+        console.warn(
+          `[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`,
+        );
+        setTimeout(() => {
+          cleanupBot(discordId, "auto_version_retry_error");
+          versionCache.set(hostLower, nextVersion);
+          saveVersionCache();
+          startBot(discordId, minecraftUser, `${host}:${port}`, "auto", onDeviceCode);
+        }, 1500);
+        return;
+      }
     }
     // If it's an auth error, remove the cached token so next attempt re-auths
     if (
