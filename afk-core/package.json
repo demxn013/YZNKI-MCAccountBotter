@@ -1,0 +1,15 @@
+{
+  "name": "yazanaki-mcbot-afk-core",
+  "version": "0.1.0",
+  "description": "AFK/Bot core service for KenzAI mcbot (Minecraft Java AFK sessions)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.27.2",
+    "minecraft-protocol": "^1.48.0",
+    "pino": "^9.2.0"
+  }
+}
