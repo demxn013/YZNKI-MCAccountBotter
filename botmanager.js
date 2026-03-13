@@ -151,7 +151,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       host,
       port,
       username: minecraftUser,
-      version: version || "1.20.1",
+      version: version || "1.21.11",
       // Microsoft auth — required for online-mode servers (DonutSMP etc.)
       auth: "microsoft",
       // Provide cached token folder so device-code flow can reuse tokens
@@ -177,7 +177,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     minecraftUser,
     serverHost: host,
     serverPort: port,
-    version: version || "1.20.1",
+    version: version || "1.21.11",
     startedAt: new Date().toISOString(),
     status: "connecting",
     spawnError: null,

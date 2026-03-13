@@ -12,7 +12,7 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
-    super("donutsmp", ["1.20.1"]);
+    super("donutsmp", ["1.21.11"]);
     this._lastMoveAt = 0;
   }
 

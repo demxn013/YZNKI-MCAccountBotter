@@ -11,7 +11,7 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class HypixelProfile extends BaseProfile {
   constructor() {
-    super("hypixel", ["1.8.9", "1.20.1"]);
+    super("hypixel", ["1.8.9", "1.21.11"]);
   }
 
   buildClientOptions(baseOptions) {

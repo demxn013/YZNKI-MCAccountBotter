@@ -10,7 +10,7 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class FreshSmpProfile extends BaseProfile {
   constructor() {
-    super("freshsmp", ["1.20.1"]);
+    super("freshsmp", ["1.21.11"]);
   }
 
   buildClientOptions(baseOptions) {

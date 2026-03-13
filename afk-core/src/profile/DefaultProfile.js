@@ -8,7 +8,7 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class DefaultProfile extends BaseProfile {
   constructor() {
-    super("default", ["1.20.1"]);
+    super("default", ["1.21.11"]);
   }
 
   buildClientOptions(baseOptions) {
