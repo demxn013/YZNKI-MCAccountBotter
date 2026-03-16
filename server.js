@@ -1,9 +1,24 @@
 // yazanaki/mcbot/server.js (VPS-side)
 // Express API server — receives bot commands from KenzAI Discord Bot.
-// This is a direct, drop-in copy of your YZNKI-MCAccountBotter server.js,
-// unchanged except for path comments so you can copy it back easily.
 
 "use strict";
+
+// ============================================================
+// SUPPRESS PARTIAL-PACKET NOISE FROM node-minecraft-protocol
+// These "Chunk size is X but only Y was read" messages are benign
+// internal warnings from the packet decoder — mineflayer handles
+// them automatically. They only clutter logs.
+// ============================================================
+const _origLog = console.log.bind(console);
+console.log = (...args) => {
+  if (typeof args[0] === "string" && args[0].startsWith("Chunk size is")) return;
+  _origLog(...args);
+};
+const _origWarn = console.warn.bind(console);
+console.warn = (...args) => {
+  if (typeof args[0] === "string" && args[0].startsWith("Chunk size is")) return;
+  _origWarn(...args);
+};
 
 require("dotenv").config();
 
@@ -37,6 +52,14 @@ if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM
 const pendingDeviceCodes = new Map();
 
 // ============================================================
+// PENDING LINK VERIFICATION (for /link command via VPS auth)
+// When a bot started with forLinkVerification spawns, we store
+// the verified MC username here. Map<discordId, { mcUsername, createdAt }>
+// ============================================================
+const pendingLinkVerified = new Map();
+const LINK_VERIFIED_EXPIRY_MS = 5 * 60 * 1000;
+
+// ============================================================
 // MIDDLEWARE — API Key Auth
 // ============================================================
 
@@ -68,7 +91,7 @@ app.get("/ping", (req, res) => {
 // ============================================================
 // ROUTE: Start Bot
 // POST /start
-// Body: { discordId, minecraftUser, serverAddress, version }
+// Body: { discordId, minecraftUser, serverAddress, version, forLinkVerification? }
 //
 // If Microsoft auth is needed (no cached token), the device code
 // is stored in pendingDeviceCodes. The Discord bot should poll
@@ -77,11 +100,10 @@ app.get("/ping", (req, res) => {
 // ============================================================
 
 app.post("/start", (req, res) => {
-  const { discordId, minecraftUser, serverAddress, version } = req.body;
+  const { discordId, minecraftUser, serverAddress, version, forLinkVerification } = req.body;
 
-  console.log(`[server] 📥 POST /start — discordId=${discordId} mc=${minecraftUser} server=${serverAddress} v=${version}`);
+  console.log(`[server] 📥 POST /start — discordId=${discordId} mc=${minecraftUser} server=${serverAddress} v=${version} linkOnly=${!!forLinkVerification}`);
 
-  // Validate required fields
   if (!discordId || typeof discordId !== "string") {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
   }
@@ -92,19 +114,46 @@ app.post("/start", (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid serverAddress" });
   }
 
-  // Device code callback — stores the code so Discord bot can poll for it
+  // Clear any stale device code from a previous run so the new code isn't silently ignored.
+  if (pendingDeviceCodes.has(discordId.trim())) {
+    console.log(`[server] 🧹 Clearing stale device code for ${discordId} before new start`);
+    pendingDeviceCodes.delete(discordId.trim());
+  }
+
+  // Device code callback — stores the code so Discord bot can poll for it.
+  // We only keep the first code per discordId; regenerated codes after expiry are ignored
+  // so the user isn't silently rotated onto a new code they never see.
   const onDeviceCode = (userCode, verificationUri, expiresIn) => {
-    const expiresAt = Date.now() + (expiresIn * 1000);
-    pendingDeviceCodes.set(discordId.trim(), { userCode, verificationUri, expiresAt });
+    const key = discordId.trim();
+    if (pendingDeviceCodes.has(key)) {
+      console.log(`[server] 🔐 Ignoring regenerated device code for ${discordId} (one active already).`);
+      return;
+    }
+    const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
+    const effectiveExpiresIn = Math.min(
+      typeof expiresIn === "number" ? expiresIn : ENFORCED_DEVICE_CODE_TTL_SEC,
+      ENFORCED_DEVICE_CODE_TTL_SEC
+    );
+    const expiresAt = Date.now() + (effectiveExpiresIn * 1000);
+    pendingDeviceCodes.set(key, { userCode, verificationUri, expiresAt });
     console.log(`[server] 🔐 Device code stored for ${discordId}: ${userCode} @ ${verificationUri}`);
   };
+
+  // When forLinkVerification: on login the botmanager will call this, then stop the bot.
+  const onLinkVerified = forLinkVerification
+    ? (did, mcUsername) => {
+        pendingLinkVerified.set(String(did).trim(), { mcUsername, createdAt: Date.now() });
+        console.log(`[server] 🔗 Link verified for ${did}: MC username ${mcUsername}`);
+      }
+    : null;
 
   const result = startBot(
     discordId.trim(),
     minecraftUser.trim(),
     serverAddress.trim(),
-    (version || "1.21.8").trim(),
-    onDeviceCode
+    (version || "1.21.4").trim(),
+    onDeviceCode,
+    onLinkVerified
   );
 
   if (!result.success) {
@@ -127,13 +176,14 @@ app.post("/start", (req, res) => {
 app.get("/devicecode/:discordId", (req, res) => {
   const { discordId } = req.params;
 
+  console.log(`[server] 📥 GET /devicecode/${discordId}`);
+
   const entry = pendingDeviceCodes.get(discordId.trim());
 
   if (!entry) {
     return res.status(404).json({ ok: false, pending: false });
   }
 
-  // Clean up expired codes
   if (Date.now() > entry.expiresAt) {
     pendingDeviceCodes.delete(discordId.trim());
     return res.status(404).json({ ok: false, pending: false, reason: "expired" });
@@ -160,6 +210,27 @@ app.delete("/devicecode/:discordId", (req, res) => {
 });
 
 // ============================================================
+// ROUTE: Get link verification result (for /link via VPS auth)
+// GET /link/verified/:discordId
+// Returns { ok: true, mcUsername } once the link-verification bot
+// has spawned; removes the entry. 404 if none or expired.
+// ============================================================
+
+app.get("/link/verified/:discordId", (req, res) => {
+  const discordId = req.params.discordId.trim();
+  const entry = pendingLinkVerified.get(discordId);
+  if (!entry) {
+    return res.status(404).json({ ok: false, reason: "no_result" });
+  }
+  if (Date.now() - entry.createdAt > LINK_VERIFIED_EXPIRY_MS) {
+    pendingLinkVerified.delete(discordId);
+    return res.status(404).json({ ok: false, reason: "expired" });
+  }
+  pendingLinkVerified.delete(discordId);
+  return res.status(200).json({ ok: true, mcUsername: entry.mcUsername });
+});
+
+// ============================================================
 // ROUTE: Stop Bot
 // POST /stop
 // Body: { discordId }
@@ -173,6 +244,9 @@ app.post("/stop", (req, res) => {
   if (!discordId || typeof discordId !== "string") {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
   }
+
+  // Clear any pending device code so a fresh /start always gets a clean slate
+  pendingDeviceCodes.delete(discordId.trim());
 
   const result = stopBot(discordId.trim());
 
@@ -220,6 +294,8 @@ app.get("/list", (req, res) => {
 
 app.post("/stopall", (req, res) => {
   console.log(`[server] 📥 POST /stopall`);
+  // Clear all pending device codes too
+  pendingDeviceCodes.clear();
   const result = stopAllBots();
   return res.status(200).json({ ok: true, message: "All bots stopped", ...result });
 });
@@ -250,4 +326,3 @@ process.on("SIGTERM", () => {
   stopAllBots();
   process.exit(0);
 });
-
