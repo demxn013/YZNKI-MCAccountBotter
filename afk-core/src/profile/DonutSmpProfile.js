@@ -12,13 +12,13 @@ const { BaseProfile } = require("./BaseProfile");
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
-    super("donutsmp", ["1.20.4", "1.20.1"]);
+    super("donutsmp", ["1.21.4"]);
     this._lastMoveAt = 0;
     this._versionCache = new Map(); // hostLower -> version
   }
 
   _getCandidates() {
-    return ["1.20.4", "1.20.1", "1.19.4"];
+    return ["1.21.4"];
   }
 
   _resolveAutoVersion(hostLower) {
