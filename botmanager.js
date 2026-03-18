@@ -123,11 +123,15 @@ function clearAuthCache(username) {
 
 // ============================================================
 // IN-MEMORY BOT REGISTRY
+//
+// Key: botId = `${discordId}:${minecraftUser.toLowerCase()}`
+// This allows multiple bots per Discord user (one per MC account).
 // ============================================================
 const activeBots = new Map();
 
 // ============================================================
 // AUTH ERROR DEDUP GUARD
+// Keyed by botId so each account has its own dedup state.
 // ============================================================
 const handledAuthErrors = new Set();
 const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -225,18 +229,16 @@ function parseServerAddress(serverAddress) {
 
 // ============================================================
 // FATAL ERROR DETECTION
-// Errors that should never trigger a reconnect loop because
-// retrying will never succeed without user intervention.
 // ============================================================
 
 function isFatalNetworkError(errCode, errMessage) {
   const FATAL_CODES = new Set([
-    "ENOTFOUND",   // DNS resolution failed — hostname doesn't exist
-    "EAI_AGAIN",   // DNS temporarily unavailable (transient but still fatal for loop)
-    "EAI_NONAME",  // DNS name does not exist
-    "ECONNREFUSED",// Port is closed — server is down
-    "ENETUNREACH", // No route to host
-    "EHOSTUNREACH",// Host unreachable
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "EAI_NONAME",
+    "ECONNREFUSED",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
   ]);
 
   if (errCode && FATAL_CODES.has(errCode)) return true;
@@ -274,7 +276,7 @@ function getFatalErrorMessage(errCode, errMessage) {
 // DEVICE CODE HANDLER
 // ============================================================
 
-function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId) {
+function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId) {
   const {
     user_code: userCode,
     verification_uri: verificationUri,
@@ -284,8 +286,8 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
 
   const effectiveExpiresIn = expiresIn || 900;
 
-  const entry = discordId
-    ? activeBots.get(discordId)
+  const entry = botId
+    ? activeBots.get(botId)
     : [...activeBots.values()].find(
         (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
       );
@@ -305,8 +307,8 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
       "Microsoft authentication failed — the sign-in session could not be completed. " +
       "Please run /mcbot start again to receive a fresh login code.";
 
-    if (discordId) {
-      setTimeout(() => cleanupBot(discordId, "auth_second_code"), 0);
+    if (botId) {
+      setTimeout(() => cleanupBot(botId, "auth_second_code"), 0);
     }
     return;
   }
@@ -319,15 +321,15 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
       clearTimeout(entry.spawnTimeoutId);
     }
     entry.spawnTimeoutId = setTimeout(() => {
-      if (!activeBots.has(discordId)) return;
-      const e = activeBots.get(discordId);
+      if (!activeBots.has(botId)) return;
+      const e = activeBots.get(botId);
       if (e.status !== "connecting") return;
       console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 300s (auth) — cleaning up`);
       e.spawnError =
         "Authentication timed out — the Microsoft device code was not redeemed in time. " +
         "Run /mcbot start again to get a new code.";
       e.status = "error";
-      setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
+      setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
     }, 5 * 60 * 1000);
   }
 
@@ -348,6 +350,18 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
 }
 
 // ============================================================
+// BOT ID HELPER
+// ============================================================
+
+/**
+ * Compute the canonical bot key for the activeBots map.
+ * Format: `${discordId}:${minecraftUser.toLowerCase()}`
+ */
+function makeBotId(discordId, minecraftUser) {
+  return `${discordId}:${minecraftUser.toLowerCase()}`;
+}
+
+// ============================================================
 // START BOT
 // ============================================================
 
@@ -360,11 +374,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   console.log(`  Version:      ${version}`);
   console.log(`  Auth mode:    microsoft`);
 
-  handledAuthErrors.delete(discordId);
+  const botId = makeBotId(discordId, minecraftUser);
 
-  if (activeBots.has(discordId)) {
-    const existing = activeBots.get(discordId);
-    console.warn(`[botmanager] ⚠️ User already has an active bot on ${existing.serverHost}:${existing.serverPort}`);
+  handledAuthErrors.delete(botId);
+
+  if (activeBots.has(botId)) {
+    const existing = activeBots.get(botId);
+    console.warn(`[botmanager] ⚠️ Bot for ${minecraftUser} already active on ${existing.serverHost}:${existing.serverPort}`);
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "already_running", serverAddress: `${existing.serverHost}:${existing.serverPort}` };
   }
@@ -381,352 +397,261 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   const autoMode = requestedVersion.toLowerCase() === "auto";
   const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
   const cached = autoMode ? versionCache.get(hostLower) : null;
-  let effectiveVersion = autoMode ? (cached || autoCandidates[0] || "1.20.4") : requestedVersion;
+  let effectiveVersion = autoMode
+    ? (cached || autoCandidates[0] || "1.21.4")
+    : requestedVersion;
 
-  const linkOnly = typeof onLinkVerified === "function";
-  const profilesFolder = ensureAccountDir(minecraftUser);
+  let autoVersionIndex = autoMode
+    ? Math.max(0, autoCandidates.indexOf(effectiveVersion))
+    : -1;
 
-  const cachedToken = loadToken(minecraftUser);
-  const needsInteractiveAuth = !cachedToken;
-
-  if (cachedToken) {
-    console.log(`[botmanager] 🔑 Using cached Microsoft token for ${minecraftUser} (${profilesFolder})`);
-  } else {
-    console.log(`[botmanager] 🔑 No cached token for ${minecraftUser} — device code auth will be required`);
-  }
-
-  let bot;
-  try {
-    bot = mineflayer.createBot({
-      host,
-      port,
-      username: minecraftUser,
-      version: effectiveVersion,
-      auth: "microsoft",
-      profilesFolder,
-      hideErrors: false,
-      logErrors: true,
-      onMsaCode: (deviceCodeResponse) => {
-        handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId);
-      },
-    });
-  } catch (err) {
-    console.error(`[botmanager] ❌ Failed to create bot:`, err.message);
-    const errLower = (err.message || "").toLowerCase();
-    if (autoMode && (errLower.includes("not supported") || errLower.includes("unsupported version"))) {
-      if (versionCache.has(hostLower)) {
-        console.warn(`[botmanager] 🗑️ Evicting unsupported cached version "${versionCache.get(hostLower)}" for ${hostLower}`);
-        versionCache.delete(hostLower);
-        saveVersionCache();
-      }
-    }
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    return { success: false, reason: "bot_creation_failed", error: err.message };
-  }
-
-  // Spawn timeout — 45s if tokens are cached (fast path), 5 min if auth needed.
-  const spawnTimeoutMs = (linkOnly || needsInteractiveAuth) ? 5 * 60 * 1000 : 45 * 1000;
+  const tokenDir = ensureAccountDir(minecraftUser);
 
   const entry = {
-    bot,
+    botId,
     discordId,
     minecraftUser,
     serverHost: host,
     serverPort: port,
     version: effectiveVersion,
-    requestedVersion,
-    autoMode,
-    autoCandidates,
-    autoCandidateIndex: autoMode ? Math.max(0, autoCandidates.indexOf(effectiveVersion)) : -1,
     startedAt: new Date().toISOString(),
     status: "connecting",
     spawnError: null,
-    linkOnly,
-    onLinkVerified: linkOnly ? onLinkVerified : null,
-    fatalError: false, // ✅ Set to true for unrecoverable errors to block reconnect
+    spawnTimeoutId: null,
+    deviceCodeEmitted: false,
+    bot: null,
   };
 
-  activeBots.set(discordId, entry);
+  activeBots.set(botId, entry);
 
-  const spawnTimeoutId = setTimeout(() => {
-    if (!activeBots.has(discordId)) return;
-    const e = activeBots.get(discordId);
+  // ── Initial spawn timeout (30s before auth code) ──────────
+  entry.spawnTimeoutId = setTimeout(() => {
+    if (!activeBots.has(botId)) return;
+    const e = activeBots.get(botId);
     if (e.status !== "connecting") return;
-
-    const seconds = Math.round(spawnTimeoutMs / 1000);
-    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${seconds}s — cleaning up`);
-
-    if (needsInteractiveAuth) {
-      e.spawnError =
-        "Authentication timed out — the Microsoft device code was not redeemed in time. " +
-        "Run /mcbot start again to get a new code.";
-    } else {
-      e.spawnError =
-        `Connection timed out — the server did not respond within ${seconds} seconds. ` +
-        "Check the server address and version.";
-    }
-
+    if (e.deviceCodeEmitted) return; // auth timeout handled separately
+    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 30s — cleaning up`);
+    e.spawnError = "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
     e.status = "error";
-    setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
-  }, spawnTimeoutMs);
+    setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
+  }, 30000);
 
-  entry.spawnTimeoutId = spawnTimeoutId;
+  function spawnBot(versionToTry) {
+    entry.version = versionToTry;
 
-  // Legacy event
-  bot.on("microsoft_device_code", (deviceCodeResponse) => {
-    handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId);
-  });
-
-  // ============================================================
-  // BOT EVENTS
-  // ============================================================
-
-  bot.once("login", () => {
-    const e = activeBots.get(discordId);
-    if (!e) return;
-    if (!e.linkOnly || !e.onLinkVerified || e.linkVerifiedSent) return;
-    e.linkVerifiedSent = true;
-    e.status = "online";
-    e.spawnError = null;
-    if (e.spawnTimeoutId) clearTimeout(e.spawnTimeoutId);
-
-    const verifiedName = bot.username || minecraftUser;
+    let bot;
     try {
-      e.onLinkVerified(discordId, verifiedName);
+      bot = mineflayer.createBot({
+        host,
+        port,
+        username: minecraftUser,
+        version: versionToTry,
+        auth: "microsoft",
+        profilesFolder: tokenDir,
+        onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+      });
     } catch (err) {
-      console.warn(`[botmanager] ⚠️ onLinkVerified threw:`, err.message);
-    }
-    setTimeout(() => cleanupBot(discordId, "link_verified_login"), 500);
-  });
-
-  bot.once("spawn", () => {
-    const currentEntry = activeBots.get(discordId);
-    if (currentEntry && currentEntry.spawnTimeoutId) {
-      clearTimeout(currentEntry.spawnTimeoutId);
-    }
-    console.log(`[botmanager] ✅ Bot spawned: ${minecraftUser} on ${host}:${port}`);
-    if (currentEntry) {
-      currentEntry.status = "online";
-      currentEntry.spawnError = null;
-      currentEntry.everSpawned = true;
-      currentEntry.socketClosedReconnects = 0;
-      currentEntry.fatalError = false;
-    }
-
-    if (autoMode) {
-      versionCache.set(hostLower, effectiveVersion);
-      saveVersionCache();
-    }
-
-    saveToken(minecraftUser);
-  });
-
-  bot.on("kicked", (reason) => {
-    const currentEntry = activeBots.get(discordId);
-    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
-
-    let reasonText;
-    if (typeof reason === "string") {
-      try {
-        const parsed = JSON.parse(reason);
-        reasonText = parsed.text || parsed.translate || reason;
-      } catch {
-        reasonText = reason;
-      }
-    } else if (reason && typeof reason === "object") {
-      reasonText = reason.text || reason.translate || reason.reason || JSON.stringify(reason);
-    } else {
-      reasonText = String(reason);
-    }
-
-    console.warn(`[botmanager] 🦶 Bot kicked: ${minecraftUser} — ${reasonText}`);
-    if (activeBots.has(discordId)) {
-      activeBots.get(discordId).spawnError = `Kicked: ${reasonText}`;
-      activeBots.get(discordId).status = "error";
-    }
-
-    if (autoMode && shouldRotateVersionForReason(reasonText)) {
-      const e = activeBots.get(discordId);
-      const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
-      const nextVersion = e?.autoCandidates?.[nextIndex];
-      if (nextVersion) {
-        console.warn(`[botmanager] 🔁 Auto-version retry: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`);
-        setTimeout(() => {
-          cleanupBot(discordId, "auto_version_retry_kicked");
-          versionCache.set(hostLower, nextVersion);
-          saveVersionCache();
-          startBot(discordId, minecraftUser, `${host}:${port}`, "auto", onDeviceCode);
-        }, 1500);
-        return;
-      }
-    }
-
-    setTimeout(() => cleanupBot(discordId, "kicked"), 30000);
-  });
-
-  bot.on("error", (err) => {
-    const currentEntry = activeBots.get(discordId);
-    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
-
-    if (handledAuthErrors.has(discordId)) {
+      console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
+      entry.status = "error";
+      entry.spawnError = `Failed to create bot: ${err.message}`;
+      cleanupBot(botId, "create_error");
       return;
     }
 
-    console.error(`[botmanager] ❌ Bot error: ${minecraftUser} — ${err.message}`);
-    if (currentEntry) {
-      currentEntry.spawnError = err.message;
-      currentEntry.status = "error";
-    }
+    entry.bot = bot;
 
-    // ✅ FATAL ERROR GUARD: DNS failures and unreachable hosts must not trigger
-    // the reconnect loop — retrying ENOTFOUND endlessly wastes resources and
-    // spams logs. Mark as fatal so bot.on("end") skips reconnect.
-    if (isFatalNetworkError(err.code, err.message)) {
-      console.warn(`[botmanager] 🚫 Fatal network error for ${minecraftUser} (${err.code || "unknown"}) — disabling reconnect`);
-      if (currentEntry) {
-        currentEntry.fatalError = true;
-        currentEntry.spawnError = getFatalErrorMessage(err.code, err.message);
-        currentEntry.status = "error";
+    bot.once("login", () => {
+      if (!activeBots.has(botId)) return;
+      console.log(`[botmanager] ✅ Bot logged in: ${minecraftUser} on ${host}:${port} (${versionToTry})`);
+      const e = activeBots.get(botId);
+      if (e.spawnTimeoutId) {
+        clearTimeout(e.spawnTimeoutId);
+        e.spawnTimeoutId = null;
       }
-      setTimeout(() => cleanupBot(discordId, "fatal_network_error"), 30000);
-      return;
-    }
+      e.status = "online";
+      e.version = versionToTry;
 
-    if (autoMode && shouldRotateVersionForReason(err.message) && !(currentEntry && currentEntry.deviceCodeEmitted)) {
-      const e = activeBots.get(discordId);
-      const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
-      const nextVersion = e?.autoCandidates?.[nextIndex];
-      if (nextVersion) {
-        console.warn(`[botmanager] 🔁 Auto-version retry: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`);
-        setTimeout(() => {
-          cleanupBot(discordId, "auto_version_retry_error");
-          versionCache.set(hostLower, nextVersion);
-          saveVersionCache();
-          startBot(discordId, minecraftUser, `${host}:${port}`, "auto", onDeviceCode);
-        }, 1500);
-        return;
-      }
-    }
-
-    const msgLower = (err.message || "").toLowerCase();
-    const isAuthError =
-      msgLower.includes("invalid_grant") ||
-      msgLower.includes("device_code") ||
-      msgLower.includes("microsoft") ||
-      msgLower.includes("auth") ||
-      msgLower.includes("token") ||
-      msgLower.includes("session") ||
-      msgLower.includes("xbox") ||
-      msgLower.includes("msa");
-
-    if (isAuthError) {
-      handledAuthErrors.add(discordId);
-      setTimeout(() => handledAuthErrors.delete(discordId), AUTH_ERROR_DEDUP_TTL_MS);
-
-      console.warn(`[botmanager] 🔑 Auth error detected — clearing cached auth for ${minecraftUser}`);
-      clearAuthCache(minecraftUser);
-
-      const e = activeBots.get(discordId);
-      if (e) {
-        e.deviceCodeExpired = true;
-        e.spawnError =
-          "Microsoft authentication failed — the sign-in session could not be completed. " +
-          "Run /mcbot start again to get a fresh login code.";
+      if (autoMode) {
+        versionCache.set(hostLower, versionToTry);
+        saveVersionCache();
       }
 
-      cleanupBot(discordId, "auth_error");
-      return;
-    }
+      saveToken(minecraftUser);
 
-    setTimeout(() => cleanupBot(discordId, "error"), 30000);
-  });
+      if (typeof onLinkVerified === "function") {
+        try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
+      }
+    });
 
-  bot.on("end", (reason) => {
-    const currentEntry = activeBots.get(discordId);
-    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
+    bot.on("kicked", (reason) => {
+      if (!activeBots.has(botId)) return;
+      const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
+      console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
 
-    console.log(`[botmanager] 🔌 Bot disconnected: ${minecraftUser} — reason: ${reason}`);
-
-    // ✅ FATAL ERROR GUARD: If a fatal network error was recorded (e.g. ENOTFOUND),
-    // skip reconnect entirely. The error handler already scheduled a cleanup.
-    if (currentEntry && currentEntry.fatalError) {
-      console.warn(`[botmanager] 🚫 Skipping reconnect for ${minecraftUser} — fatal error flagged (${reason})`);
-      return;
-    }
-
-    if (AUTO_RECONNECT && activeBots.has(discordId)) {
-      const e = activeBots.get(discordId);
-
-      const MAX_PRESPAWN_RECONNECTS = 3;
-      if (!e.everSpawned && reason === "socketClosed") {
-        e.socketClosedReconnects = (e.socketClosedReconnects || 0) + 1;
-        if (e.socketClosedReconnects >= MAX_PRESPAWN_RECONNECTS) {
-          console.warn(`[botmanager] ⛔ ${minecraftUser} hit ${MAX_PRESPAWN_RECONNECTS} socketClosed failures before spawning — giving up.`);
-          e.status = "error";
-          e.spawnError =
-            `The server closed the connection ${MAX_PRESPAWN_RECONNECTS} times before the bot could spawn. ` +
-            `The server may be running a version newer than 1.21.4 (which mineflayer does not support) or may be temporarily blocking connections. ` +
-            `Try again later or use a different server.`;
-          setTimeout(() => cleanupBot(discordId, "socket_closed_max_retries"), 30000);
+      if (autoMode && shouldRotateVersionForReason(reasonText)) {
+        autoVersionIndex++;
+        if (autoVersionIndex < autoCandidates.length) {
+          const nextVersion = autoCandidates[autoVersionIndex];
+          console.log(`[botmanager] 🔄 Auto-version rotate: trying ${nextVersion} for ${minecraftUser}`);
+          try { bot.end(); } catch (_) {}
+          spawnBot(nextVersion);
           return;
         }
-        console.log(`[botmanager] 🔄 socketClosed before spawn (attempt ${e.socketClosedReconnects}/${MAX_PRESPAWN_RECONNECTS}) — retrying in ${RECONNECT_DELAY_MS}ms for ${minecraftUser}...`);
-      } else {
-        console.log(`[botmanager] 🔄 Auto-reconnect in ${RECONNECT_DELAY_MS}ms for ${minecraftUser}...`);
       }
 
-      e.status = "reconnecting";
-      setTimeout(() => {
-        if (activeBots.has(discordId) && activeBots.get(discordId).status === "reconnecting") {
-          cleanupBot(discordId, "reconnect_cycle");
-          const result = startBot(discordId, minecraftUser, `${host}:${port}`, version, onDeviceCode, onLinkVerified);
-          if (!result.success) {
-            console.error(`[botmanager] ❌ Auto-reconnect failed for ${minecraftUser}: ${result.reason}`);
-          }
-        }
-      }, RECONNECT_DELAY_MS);
-    } else {
-      cleanupBot(discordId, "end");
-    }
-  });
+      const e = activeBots.get(botId);
+      e.status = "error";
+      e.spawnError = `Kicked: ${reasonText}`;
 
-  console.log(`[botmanager] ✅ Bot started successfully: ${minecraftUser} → ${host}:${port}`);
+      if (AUTO_RECONNECT) {
+        console.log(`[botmanager] 🔄 Reconnecting ${minecraftUser} in ${RECONNECT_DELAY_MS}ms...`);
+        e.status = "reconnecting";
+        setTimeout(() => {
+          if (!activeBots.has(botId)) return;
+          try { bot.end(); } catch (_) {}
+          spawnBot(e.version);
+        }, RECONNECT_DELAY_MS);
+      } else {
+        cleanupBot(botId, "kicked");
+      }
+    });
+
+    bot.on("error", (err) => {
+      if (!activeBots.has(botId)) return;
+      const e = activeBots.get(botId);
+
+      const errCode = err.code;
+      const errMessage = err.message || "";
+
+      console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
+
+      // ── Auth error dedup ───────────────────────────────────
+      const isAuthError =
+        errMessage.includes("invalid_grant") ||
+        errMessage.includes("AADSTS") ||
+        errMessage.includes("authentication") ||
+        errMessage.toLowerCase().includes("token");
+
+      if (isAuthError) {
+        if (handledAuthErrors.has(botId)) {
+          console.warn(`[botmanager] 🔇 Suppressing duplicate auth error for ${minecraftUser}`);
+          return;
+        }
+        handledAuthErrors.add(botId);
+        setTimeout(() => handledAuthErrors.delete(botId), AUTH_ERROR_DEDUP_TTL_MS);
+
+        clearAuthCache(minecraftUser);
+        e.status = "error";
+        e.spawnError = "Microsoft authentication failed. Run /mcbot start again to sign in.";
+        e.errorCategory = "auth_error";
+        cleanupBot(botId, "auth_error");
+        return;
+      }
+
+      if (isFatalNetworkError(errCode, errMessage)) {
+        e.status = "error";
+        e.spawnError = getFatalErrorMessage(errCode, errMessage);
+        cleanupBot(botId, "fatal_network_error");
+        return;
+      }
+
+      e.status = "error";
+      e.spawnError = errMessage;
+
+      if (AUTO_RECONNECT) {
+        console.log(`[botmanager] 🔄 Reconnecting ${minecraftUser} in ${RECONNECT_DELAY_MS}ms (error)...`);
+        e.status = "reconnecting";
+        setTimeout(() => {
+          if (!activeBots.has(botId)) return;
+          try { bot.end(); } catch (_) {}
+          spawnBot(e.version);
+        }, RECONNECT_DELAY_MS);
+      } else {
+        cleanupBot(botId, "error");
+      }
+    });
+
+    bot.on("end", (reason) => {
+      if (!activeBots.has(botId)) return;
+      const e = activeBots.get(botId);
+      if (e.status === "online" || e.status === "connecting") {
+        console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
+        e.status = "error";
+        e.spawnError = `Disconnected: ${reason}`;
+
+        if (AUTO_RECONNECT) {
+          e.status = "reconnecting";
+          setTimeout(() => {
+            if (!activeBots.has(botId)) return;
+            spawnBot(e.version);
+          }, RECONNECT_DELAY_MS);
+        } else {
+          cleanupBot(botId, "end");
+        }
+      }
+    });
+  }
+
+  spawnBot(effectiveVersion);
+
+  console.log(`[botmanager] 🚀 Bot spawned for ${minecraftUser} (botId: ${botId})`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-  return { success: true };
+
+  return { success: true, botId };
 }
 
 // ============================================================
 // STOP / CLEANUP
 // ============================================================
 
-function stopBot(discordId) {
+/**
+ * Stop a specific bot by discordId + minecraftUser.
+ */
+function stopBot(discordId, minecraftUser) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log(`[botmanager] 🛑 Stopping bot for discordId: ${discordId}`);
+  console.log(`[botmanager] 🛑 Stopping bot — discordId: ${discordId}, mc: ${minecraftUser}`);
 
-  const entry = activeBots.get(discordId);
+  const botId = makeBotId(discordId, minecraftUser);
+  const entry = activeBots.get(botId);
   if (!entry) {
-    console.warn(`[botmanager] ⚠️ No bot running for ${discordId}`);
+    console.warn(`[botmanager] ⚠️ No bot running for ${botId}`);
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "no_bot_running" };
   }
 
-  cleanupBot(discordId, "manual_stop");
-  console.log(`[botmanager] ✅ Bot stopped for ${entry.minecraftUser}`);
+  cleanupBot(botId, "manual_stop");
+  console.log(`[botmanager] ✅ Bot stopped for ${minecraftUser}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
   return { success: true };
+}
+
+/**
+ * Stop ALL bots for a given discordId (convenience).
+ */
+function stopBotsForUser(discordId) {
+  console.log(`[botmanager] 🛑 Stopping all bots for discordId: ${discordId}`);
+  const prefix = `${discordId}:`;
+  let count = 0;
+  for (const botId of [...activeBots.keys()]) {
+    if (botId.startsWith(prefix)) {
+      cleanupBot(botId, "stop_user_all");
+      count++;
+    }
+  }
+  return { success: true, stopped: count };
 }
 
 function stopAllBots() {
   const count = activeBots.size;
   console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
-  for (const discordId of [...activeBots.keys()]) {
-    cleanupBot(discordId, "stopall");
+  for (const botId of [...activeBots.keys()]) {
+    cleanupBot(botId, "stopall");
   }
   return { success: true, stopped: count };
 }
 
-function cleanupBot(discordId, reason) {
-  const entry = activeBots.get(discordId);
+function cleanupBot(botId, reason) {
+  const entry = activeBots.get(botId);
   if (!entry) return;
 
   if (entry.spawnTimeoutId) {
@@ -734,7 +659,7 @@ function cleanupBot(discordId, reason) {
     entry.spawnTimeoutId = null;
   }
 
-  activeBots.delete(discordId);
+  activeBots.delete(botId);
 
   try { entry.bot.quit(); } catch (_) {}
   try { entry.bot.end(); } catch (_) {}
@@ -746,13 +671,18 @@ function cleanupBot(discordId, reason) {
 // STATUS / LIST
 // ============================================================
 
-function getBotStatus(discordId) {
-  const entry = activeBots.get(discordId);
+/**
+ * Get status for a specific (discordId, minecraftUser) bot.
+ */
+function getBotStatus(discordId, minecraftUser) {
+  const botId = makeBotId(discordId, minecraftUser);
+  const entry = activeBots.get(botId);
   if (!entry) return { found: false };
 
   return {
     found: true,
     bot: {
+      botId: entry.botId,
       discordId: entry.discordId,
       minecraftUser: entry.minecraftUser,
       serverHost: entry.serverHost,
@@ -766,12 +696,38 @@ function getBotStatus(discordId) {
   };
 }
 
+/**
+ * Get statuses for ALL bots belonging to a discordId.
+ */
+function getBotsForUser(discordId) {
+  const prefix = `${discordId}:`;
+  const bots = [];
+  for (const [botId, entry] of activeBots.entries()) {
+    if (botId.startsWith(prefix)) {
+      bots.push({
+        botId: entry.botId,
+        discordId: entry.discordId,
+        minecraftUser: entry.minecraftUser,
+        serverHost: entry.serverHost,
+        serverPort: entry.serverPort,
+        version: entry.version,
+        startedAt: entry.startedAt,
+        status: entry.status,
+        spawnError: entry.spawnError || null,
+        uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+      });
+    }
+  }
+  return bots;
+}
+
 function getBotCount() {
   return activeBots.size;
 }
 
 function listAllBots() {
   return [...activeBots.values()].map((entry) => ({
+    botId: entry.botId,
     discordId: entry.discordId,
     minecraftUser: entry.minecraftUser,
     serverHost: entry.serverHost,
@@ -784,10 +740,13 @@ function listAllBots() {
 }
 
 module.exports = {
+  makeBotId,
   startBot,
   stopBot,
+  stopBotsForUser,
   stopAllBots,
   getBotStatus,
+  getBotsForUser,
   listAllBots,
   getBotCount,
 };

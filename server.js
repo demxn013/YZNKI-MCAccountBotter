@@ -21,10 +21,13 @@ require("dotenv").config();
 
 const express = require("express");
 const {
+  makeBotId,
   startBot,
   stopBot,
+  stopBotsForUser,
   stopAllBots,
   getBotStatus,
+  getBotsForUser,
   listAllBots,
   getBotCount,
 } = require("./botmanager");
@@ -42,7 +45,9 @@ if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM
 
 // ============================================================
 // PENDING DEVICE CODES
-// Map<discordId, { userCode, verificationUri, expiresAt }>
+// Map<botId, { userCode, verificationUri, expiresAt }>
+//
+// botId = `${discordId}:${minecraftUser.toLowerCase()}`
 //
 // Always stores the LATEST code — if prismarine-auth's retry loop
 // generates a new code after the first one, we overwrite so the
@@ -89,6 +94,7 @@ app.get("/ping", (req, res) => {
 // ============================================================
 // ROUTE: Start Bot
 // POST /start
+// Body: { discordId, minecraftUser, serverAddress, version, forLinkVerification? }
 // ============================================================
 
 app.post("/start", (req, res) => {
@@ -106,10 +112,12 @@ app.post("/start", (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid serverAddress" });
   }
 
-  // Clear any stale device code from a previous run
-  if (pendingDeviceCodes.has(discordId.trim())) {
-    console.log(`[server] 🧹 Clearing stale device code for ${discordId} before new start`);
-    pendingDeviceCodes.delete(discordId.trim());
+  const botId = makeBotId(discordId.trim(), minecraftUser.trim());
+
+  // Clear any stale device code from a previous run for this specific bot
+  if (pendingDeviceCodes.has(botId)) {
+    console.log(`[server] 🧹 Clearing stale device code for ${botId} before new start`);
+    pendingDeviceCodes.delete(botId);
   }
 
   // Device code callback.
@@ -120,19 +128,18 @@ app.post("/start", (req, res) => {
   // codes will have been consumed/invalidated by Microsoft by the time the
   // user tries to enter them.
   const onDeviceCode = (userCode, verificationUri, expiresIn) => {
-    const key = discordId.trim();
     const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
     const effectiveExpiresIn = Math.min(
       typeof expiresIn === "number" ? expiresIn : ENFORCED_DEVICE_CODE_TTL_SEC,
       ENFORCED_DEVICE_CODE_TTL_SEC
     );
     const expiresAt = Date.now() + (effectiveExpiresIn * 1000);
-    const existing = pendingDeviceCodes.get(key);
+    const existing = pendingDeviceCodes.get(botId);
     if (existing && existing.userCode !== userCode) {
-      console.log(`[server] 🔄 Updated device code for ${discordId}: ${existing.userCode} → ${userCode}`);
+      console.log(`[server] 🔄 Updated device code for ${botId}: ${existing.userCode} → ${userCode}`);
     }
-    pendingDeviceCodes.set(key, { userCode, verificationUri, expiresAt });
-    console.log(`[server] 🔐 Device code stored for ${discordId}: ${userCode} @ ${verificationUri}`);
+    pendingDeviceCodes.set(botId, { userCode, verificationUri, expiresAt });
+    console.log(`[server] 🔐 Device code stored for ${botId}: ${userCode} @ ${verificationUri}`);
   };
 
   const onLinkVerified = forLinkVerification
@@ -161,22 +168,24 @@ app.post("/start", (req, res) => {
 
 // ============================================================
 // ROUTE: Check for Pending Device Code
-// GET /devicecode/:discordId
+// GET /devicecode/:discordId/:minecraftUser
 // ============================================================
 
-app.get("/devicecode/:discordId", (req, res) => {
-  const { discordId } = req.params;
+app.get("/devicecode/:discordId/:minecraftUser", (req, res) => {
+  const discordId = req.params.discordId.trim();
+  const minecraftUser = req.params.minecraftUser.trim();
 
-  console.log(`[server] 📥 GET /devicecode/${discordId}`);
+  const botId = makeBotId(discordId, minecraftUser);
+  console.log(`[server] 📥 GET /devicecode/${botId}`);
 
-  const entry = pendingDeviceCodes.get(discordId.trim());
+  const entry = pendingDeviceCodes.get(botId);
 
   if (!entry) {
     return res.status(404).json({ ok: false, pending: false });
   }
 
   if (Date.now() > entry.expiresAt) {
-    pendingDeviceCodes.delete(discordId.trim());
+    pendingDeviceCodes.delete(botId);
     return res.status(404).json({ ok: false, pending: false, reason: "expired" });
   }
 
@@ -191,12 +200,14 @@ app.get("/devicecode/:discordId", (req, res) => {
 
 // ============================================================
 // ROUTE: Clear Device Code
-// DELETE /devicecode/:discordId
+// DELETE /devicecode/:discordId/:minecraftUser
 // ============================================================
 
-app.delete("/devicecode/:discordId", (req, res) => {
-  const { discordId } = req.params;
-  pendingDeviceCodes.delete(discordId.trim());
+app.delete("/devicecode/:discordId/:minecraftUser", (req, res) => {
+  const discordId = req.params.discordId.trim();
+  const minecraftUser = req.params.minecraftUser.trim();
+  const botId = makeBotId(discordId, minecraftUser);
+  pendingDeviceCodes.delete(botId);
   return res.status(200).json({ ok: true });
 });
 
@@ -222,20 +233,25 @@ app.get("/link/verified/:discordId", (req, res) => {
 // ============================================================
 // ROUTE: Stop Bot
 // POST /stop
+// Body: { discordId, minecraftUser }
 // ============================================================
 
 app.post("/stop", (req, res) => {
-  const { discordId } = req.body;
+  const { discordId, minecraftUser } = req.body;
 
-  console.log(`[server] 📥 POST /stop — discordId=${discordId}`);
+  console.log(`[server] 📥 POST /stop — discordId=${discordId} mc=${minecraftUser}`);
 
   if (!discordId || typeof discordId !== "string") {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
   }
+  if (!minecraftUser || typeof minecraftUser !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing or invalid minecraftUser" });
+  }
 
-  pendingDeviceCodes.delete(discordId.trim());
+  const botId = makeBotId(discordId.trim(), minecraftUser.trim());
+  pendingDeviceCodes.delete(botId);
 
-  const result = stopBot(discordId.trim());
+  const result = stopBot(discordId.trim(), minecraftUser.trim());
 
   if (!result.success) {
     return res.status(404).json({ ok: false, ...result });
@@ -245,22 +261,35 @@ app.post("/stop", (req, res) => {
 });
 
 // ============================================================
-// ROUTE: Get Bot Status
-// GET /status/:discordId
+// ROUTE: Get Bot Status (specific account)
+// GET /status/:discordId/:minecraftUser
 // ============================================================
 
-app.get("/status/:discordId", (req, res) => {
-  const { discordId } = req.params;
+app.get("/status/:discordId/:minecraftUser", (req, res) => {
+  const discordId = req.params.discordId.trim();
+  const minecraftUser = req.params.minecraftUser.trim();
 
-  console.log(`[server] 📥 GET /status/${discordId}`);
+  console.log(`[server] 📥 GET /status/${discordId}/${minecraftUser}`);
 
-  const status = getBotStatus(discordId.trim());
+  const status = getBotStatus(discordId, minecraftUser);
 
   if (!status.found) {
-    return res.status(404).json({ ok: false, reason: "no_bot_running", discordId });
+    return res.status(404).json({ ok: false, reason: "no_bot_running", discordId, minecraftUser });
   }
 
   return res.status(200).json({ ok: true, bot: status.bot });
+});
+
+// ============================================================
+// ROUTE: List all bots for a user
+// GET /bots/:discordId
+// ============================================================
+
+app.get("/bots/:discordId", (req, res) => {
+  const discordId = req.params.discordId.trim();
+  console.log(`[server] 📥 GET /bots/${discordId}`);
+  const bots = getBotsForUser(discordId);
+  return res.status(200).json({ ok: true, count: bots.length, bots });
 });
 
 // ============================================================
