@@ -25,51 +25,37 @@ function tokenPath(username) {
 }
 
 /**
- * Check whether any Microsoft auth cache exists for a given username.
+ * Check whether a valid per-user Microsoft auth marker exists for this username.
  *
- * Two sources are checked:
- *   1. Our own marker file: ./tokens/<username>.json  (written on successful spawn)
- *   2. prismarine-auth hash-prefixed files: <hash>_live-cache.json etc.
- *      prismarine-auth manages these itself — it does NOT use nmp-cache.json.
- *      We can't map a hash to a specific username, but if ANY hash cache files
- *      exist in TOKENS_DIR we know a previous auth completed and will be reused
- *      silently by the next mineflayer.createBot() call.
+ * IMPORTANT: Only our own per-user marker file (an object with { cachedAt, username })
+ * is treated as a confirmed cache hit for THIS account. We intentionally do NOT fall
+ * back to "any prismarine-auth hash files exist" anymore, because those hash-prefixed
+ * files (<hash>_live-cache.json etc.) cannot be mapped to a specific username. If a
+ * different account authenticated previously, its hash files would still be present
+ * and would cause invalid_grant errors when reused for a new account's device-code flow.
  *
- * Returns the marker object (truthy) if our own file exists, or true if only
- * prismarine-auth cache files are found, or undefined if no cache at all.
+ * Returns the marker object (truthy) if our own marker file exists and is valid,
+ * or undefined if no confirmed cache exists for this account.
  */
 function loadToken(username) {
-  // 1. Check our own per-user marker file
   try {
     const p = tokenPath(username);
     if (fs.existsSync(p)) {
       const data = JSON.parse(fs.readFileSync(p, "utf8"));
-      return data;
+      // Must be a real object marker written by saveToken()
+      if (data && typeof data === "object" && data.username) {
+        return data;
+      }
     }
   } catch {
-    // fall through to prismarine-auth check
+    // fall through — treat as no cache
   }
-
-  // 2. Check for prismarine-auth hash-prefixed cache files.
-  //    Pattern: <hex>_live-cache.json, <hex>_xbl-cache.json, <hex>_mca-cache.json
-  try {
-    const files = fs.readdirSync(TOKENS_DIR);
-    const prismarinePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
-    const hasPrismarineCache = files.some(f => prismarinePattern.test(f));
-    if (hasPrismarineCache) {
-      return true; // prismarine-auth will silently reuse these — no device code needed
-    }
-  } catch {
-    // ignore
-  }
-
   return undefined;
 }
 
 /**
  * Write a marker file for this username so subsequent loadToken() calls
- * correctly detect that auth is cached and won't falsely warn about
- * "device code required."
+ * correctly detect that auth is cached for this specific account.
  *
  * NOTE: prismarine-auth manages its own cache files internally. We do NOT
  * try to copy or parse nmp-cache.json here — that file is not written by
@@ -352,14 +338,33 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const linkOnly = typeof onLinkVerified === "function";
 
-  // Check if Microsoft auth is already cached (our marker OR prismarine-auth hash files).
+  // ── MICROSOFT AUTH CACHE CHECK ────────────────────────────
+  // Only treat a confirmed per-user marker object as a valid cache hit.
+  //
+  // We deliberately do NOT fall back to "prismarine-auth hash files exist" here.
+  // Those <hash>_*-cache.json files cannot be mapped to a specific username.
+  // If Account A authenticated previously, its hash files remain on disk. When
+  // Account B (an alt) tries to auth, prismarine-auth finds those stale files,
+  // attempts to reuse the already-consumed device_code, and spins in an
+  // invalid_grant retry loop — which also causes the spawn timeout to fire at
+  // 45s instead of 5 minutes (because needsInteractiveAuth was wrongly false).
+  //
+  // Fix: loadToken() now only returns truthy for a real object marker written
+  // by saveToken() for THIS account. If no marker exists we proactively wipe
+  // all prismarine-auth hash files BEFORE creating the bot, so the auth flow
+  // always starts clean.
+  // ─────────────────────────────────────────────────────────
   const cachedToken = loadToken(minecraftUser);
-  const needsInteractiveAuth = !cachedToken;
+  const needsInteractiveAuth = typeof cachedToken !== "object" || cachedToken === null;
 
-  if (cachedToken) {
+  if (!needsInteractiveAuth) {
     console.log(`[botmanager] 🔑 Using cached Microsoft token for ${minecraftUser}`);
   } else {
-    console.log(`[botmanager] 🔑 No cached token for ${minecraftUser} — device code auth will be required`);
+    console.log(`[botmanager] 🔑 No valid token cache for ${minecraftUser} — device code auth will be required`);
+    // Proactively wipe any stale prismarine-auth hash-cache files that may belong
+    // to a different account. Leaving them causes invalid_grant on the new flow.
+    clearAuthCache(minecraftUser);
+    console.log(`[botmanager] 🧹 Pre-cleared stale auth cache before fresh auth for ${minecraftUser}`);
   }
 
   let bot;
@@ -498,7 +503,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     }
 
     // Write our marker file so future loadToken() calls correctly detect
-    // that prismarine-auth has cached credentials.
+    // that prismarine-auth has cached credentials for this specific account.
     saveToken(minecraftUser);
   });
 
@@ -570,14 +575,14 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     // ─────────────────────────────────────────────────────────
 
     console.error(`[botmanager] ❌ Bot error: ${minecraftUser} — ${err.message}`);
-    const entry = activeBots.get(discordId);
-    if (entry) {
-      entry.spawnError = err.message;
-      entry.status = "error";
+    const currentEntry = activeBots.get(discordId);
+    if (currentEntry) {
+      currentEntry.spawnError = err.message;
+      currentEntry.status = "error";
     }
 
     // Auto version rotation for protocol/decoder desync
-    if (autoMode && shouldRotateVersionForReason(err.message) && !(entry && entry.deviceCodeEmitted)) {
+    if (autoMode && shouldRotateVersionForReason(err.message) && !(currentEntry && currentEntry.deviceCodeEmitted)) {
       const e = activeBots.get(discordId);
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
       const nextVersion = e?.autoCandidates?.[nextIndex];
@@ -618,9 +623,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       console.warn(`[botmanager] 🔑 Auth error detected — clearing ALL cached auth for ${minecraftUser}`);
       clearAuthCache(minecraftUser);
 
-      if (entry) {
-        entry.deviceCodeExpired = true;
-        entry.spawnError =
+      const e = activeBots.get(discordId);
+      if (e) {
+        e.deviceCodeExpired = true;
+        e.spawnError =
           "Authentication failed — Microsoft sign-in did not complete or was rejected. " +
           "Ask the user to run the command again to get a new device code.";
       }
@@ -809,4 +815,4 @@ module.exports = {
   getBotStatus,
   listAllBots,
   getBotCount,
-};
+}; 
