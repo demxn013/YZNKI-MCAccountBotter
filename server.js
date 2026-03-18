@@ -5,9 +5,6 @@
 
 // ============================================================
 // SUPPRESS PARTIAL-PACKET NOISE FROM node-minecraft-protocol
-// These "Chunk size is X but only Y was read" messages are benign
-// internal warnings from the packet decoder — mineflayer handles
-// them automatically. They only clutter logs.
 // ============================================================
 const _origLog = console.log.bind(console);
 console.log = (...args) => {
@@ -45,16 +42,17 @@ if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM
 
 // ============================================================
 // PENDING DEVICE CODES
-// Stores device codes emitted during Microsoft auth so the
-// Discord bot can poll for them and DM the user.
 // Map<discordId, { userCode, verificationUri, expiresAt }>
+//
+// Always stores the LATEST code — if prismarine-auth's retry loop
+// generates a new code after the first one, we overwrite so the
+// Discord bot picks up the fresh code on its next poll.
 // ============================================================
 const pendingDeviceCodes = new Map();
 
 // ============================================================
-// PENDING LINK VERIFICATION (for /link command via VPS auth)
-// When a bot started with forLinkVerification spawns, we store
-// the verified MC username here. Map<discordId, { mcUsername, createdAt }>
+// PENDING LINK VERIFICATION
+// Map<discordId, { mcUsername, createdAt }>
 // ============================================================
 const pendingLinkVerified = new Map();
 const LINK_VERIFIED_EXPIRY_MS = 5 * 60 * 1000;
@@ -91,12 +89,6 @@ app.get("/ping", (req, res) => {
 // ============================================================
 // ROUTE: Start Bot
 // POST /start
-// Body: { discordId, minecraftUser, serverAddress, version, forLinkVerification? }
-//
-// If Microsoft auth is needed (no cached token), the device code
-// is stored in pendingDeviceCodes. The Discord bot should poll
-// GET /devicecode/:discordId after receiving a 200 here to check
-// if auth is required, then DM the user the verification link.
 // ============================================================
 
 app.post("/start", (req, res) => {
@@ -114,32 +106,35 @@ app.post("/start", (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid serverAddress" });
   }
 
-  // Clear any stale device code from a previous run so the new code isn't silently ignored.
+  // Clear any stale device code from a previous run
   if (pendingDeviceCodes.has(discordId.trim())) {
     console.log(`[server] 🧹 Clearing stale device code for ${discordId} before new start`);
     pendingDeviceCodes.delete(discordId.trim());
   }
 
-  // Device code callback — stores the code so Discord bot can poll for it.
-  // We only keep the first code per discordId; regenerated codes after expiry are ignored
-  // so the user isn't silently rotated onto a new code they never see.
+  // Device code callback.
+  //
+  // IMPORTANT: We always overwrite with the latest code. prismarine-auth's
+  // retry loop may generate multiple codes when a cached refresh token is
+  // expired. The Discord bot needs to show the LATEST valid code — the earlier
+  // codes will have been consumed/invalidated by Microsoft by the time the
+  // user tries to enter them.
   const onDeviceCode = (userCode, verificationUri, expiresIn) => {
     const key = discordId.trim();
-    if (pendingDeviceCodes.has(key)) {
-      console.log(`[server] 🔐 Ignoring regenerated device code for ${discordId} (one active already).`);
-      return;
-    }
     const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
     const effectiveExpiresIn = Math.min(
       typeof expiresIn === "number" ? expiresIn : ENFORCED_DEVICE_CODE_TTL_SEC,
       ENFORCED_DEVICE_CODE_TTL_SEC
     );
     const expiresAt = Date.now() + (effectiveExpiresIn * 1000);
+    const existing = pendingDeviceCodes.get(key);
+    if (existing && existing.userCode !== userCode) {
+      console.log(`[server] 🔄 Updated device code for ${discordId}: ${existing.userCode} → ${userCode}`);
+    }
     pendingDeviceCodes.set(key, { userCode, verificationUri, expiresAt });
     console.log(`[server] 🔐 Device code stored for ${discordId}: ${userCode} @ ${verificationUri}`);
   };
 
-  // When forLinkVerification: on login the botmanager will call this, then stop the bot.
   const onLinkVerified = forLinkVerification
     ? (did, mcUsername) => {
         pendingLinkVerified.set(String(did).trim(), { mcUsername, createdAt: Date.now() });
@@ -167,10 +162,6 @@ app.post("/start", (req, res) => {
 // ============================================================
 // ROUTE: Check for Pending Device Code
 // GET /devicecode/:discordId
-//
-// Returns the Microsoft device code if one is pending for this user.
-// The Discord bot polls this after /start to check if auth is needed.
-// Returns 404 if no code is pending (either not needed or already done).
 // ============================================================
 
 app.get("/devicecode/:discordId", (req, res) => {
@@ -199,7 +190,7 @@ app.get("/devicecode/:discordId", (req, res) => {
 });
 
 // ============================================================
-// ROUTE: Clear Device Code (after user has completed auth)
+// ROUTE: Clear Device Code
 // DELETE /devicecode/:discordId
 // ============================================================
 
@@ -210,10 +201,8 @@ app.delete("/devicecode/:discordId", (req, res) => {
 });
 
 // ============================================================
-// ROUTE: Get link verification result (for /link via VPS auth)
+// ROUTE: Get link verification result
 // GET /link/verified/:discordId
-// Returns { ok: true, mcUsername } once the link-verification bot
-// has spawned; removes the entry. 404 if none or expired.
 // ============================================================
 
 app.get("/link/verified/:discordId", (req, res) => {
@@ -233,7 +222,6 @@ app.get("/link/verified/:discordId", (req, res) => {
 // ============================================================
 // ROUTE: Stop Bot
 // POST /stop
-// Body: { discordId }
 // ============================================================
 
 app.post("/stop", (req, res) => {
@@ -245,7 +233,6 @@ app.post("/stop", (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
   }
 
-  // Clear any pending device code so a fresh /start always gets a clean slate
   pendingDeviceCodes.delete(discordId.trim());
 
   const result = stopBot(discordId.trim());
@@ -294,7 +281,6 @@ app.get("/list", (req, res) => {
 
 app.post("/stopall", (req, res) => {
   console.log(`[server] 📥 POST /stopall`);
-  // Clear all pending device codes too
   pendingDeviceCodes.clear();
   const result = stopAllBots();
   return res.status(200).json({ ok: true, message: "All bots stopped", ...result });
@@ -314,7 +300,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 });
 
-// Graceful shutdown — stop all bots cleanly
 process.on("SIGINT", () => {
   console.log("\n[server] 🔴 SIGINT received — stopping all bots and shutting down...");
   stopAllBots();

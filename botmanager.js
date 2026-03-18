@@ -18,14 +18,8 @@ const path = require("path");
 // (e.g. ab58c3_live-cache.json) into that subdirectory via
 // the `profilesFolder` option passed to mineflayer.createBot().
 //
-// This isolation means:
-//   - Cache files from account A can NEVER bleed into account B.
-//   - invalid_grant from a consumed/stale device_code belonging to
-//     a different account is fully prevented at the source.
-//   - loadToken() can safely check for hash files because any files
-//     inside tokens/<username>/ are guaranteed to belong to that account.
-//   - clearAuthCache() only ever touches that account's directory,
-//     leaving all other accounts' tokens intact.
+// This isolation means cache files from account A can never
+// bleed into account B, preventing invalid_grant errors.
 // ============================================================
 const TOKENS_ROOT = path.join(__dirname, "tokens");
 
@@ -33,25 +27,14 @@ if (!fs.existsSync(TOKENS_ROOT)) {
   fs.mkdirSync(TOKENS_ROOT, { recursive: true });
 }
 
-/**
- * Returns the per-account profile folder path.
- * prismarine-auth will read/write all its cache files here.
- */
 function accountTokenDir(username) {
   return path.join(TOKENS_ROOT, username.toLowerCase());
 }
 
-/**
- * Returns the path to our own marker file inside the account's directory.
- * Written after a successful spawn so we know this account has valid cached tokens.
- */
 function markerPath(username) {
   return path.join(accountTokenDir(username), "_marker.json");
 }
 
-/**
- * Ensure the per-account token directory exists and return its path.
- */
 function ensureAccountDir(username) {
   const dir = accountTokenDir(username);
   if (!fs.existsSync(dir)) {
@@ -62,18 +45,7 @@ function ensureAccountDir(username) {
 
 /**
  * Check whether valid Microsoft auth cache exists for this account.
- *
- * Checks the account's own isolated directory for:
- *   1. Our own _marker.json (written after a successful spawn)
- *   2. prismarine-auth hash-prefixed cache files
- *      (e.g. ab58c3_live-cache.json, ab58c3_xbl-cache.json)
- *
- * Because we use a per-account profilesFolder, any files found here
- * are guaranteed to belong to this specific account — no cross-account
- * contamination is possible.
- *
- * Returns the marker object if our marker exists, true if only prismarine-auth
- * files exist (will be silently reused), or undefined if no cache at all.
+ * Checks the account's own isolated directory only.
  */
 function loadToken(username) {
   const dir = accountTokenDir(username);
@@ -98,7 +70,7 @@ function loadToken(username) {
     const files = fs.readdirSync(dir);
     const prismarinePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
     if (files.some(f => prismarinePattern.test(f))) {
-      return true; // prismarine-auth will silently reuse these — no device code needed
+      return true;
     }
   } catch {
     // ignore
@@ -107,9 +79,6 @@ function loadToken(username) {
   return undefined;
 }
 
-/**
- * Write our marker file after a successful spawn.
- */
 function saveToken(username) {
   try {
     ensureAccountDir(username);
@@ -123,7 +92,7 @@ function saveToken(username) {
 
 /**
  * Clear ALL Microsoft auth state for a specific account.
- * Only touches that account's own subdirectory — other accounts are completely unaffected.
+ * Only touches that account's own subdirectory.
  */
 function clearAuthCache(username) {
   const dir = accountTokenDir(username);
@@ -152,25 +121,44 @@ function clearAuthCache(username) {
   }
 }
 
+/**
+ * Clear ONLY the prismarine-auth hash-prefixed cache files for an account.
+ * Leaves _marker.json intact.
+ *
+ * Called when onMsaCode fires despite having cached tokens — this means
+ * the cached refresh token expired. Clearing the hash files prevents
+ * prismarine-auth's retry loop from loading stale device_code data from
+ * the cache and getting "device_code has already been used".
+ */
+function clearHashCacheFiles(username) {
+  const dir = accountTokenDir(username);
+  if (!fs.existsSync(dir)) return;
+
+  try {
+    const files = fs.readdirSync(dir);
+    const cachePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
+    for (const file of files) {
+      if (cachePattern.test(file)) {
+        try {
+          fs.unlinkSync(path.join(dir, file));
+          console.log(`[botmanager] 🧹 Cleared stale hash cache: ${username}/${file}`);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 // ============================================================
 // IN-MEMORY BOT REGISTRY
-// Map<discordId, { bot, minecraftUser, serverHost, serverPort, version, startedAt, status, ... }>
 // ============================================================
 const activeBots = new Map();
 
 // ============================================================
 // AUTH ERROR DEDUP GUARD
-//
-// Problem: prismarine-auth has an internal retry loop. When a device code
-// expires or is rejected, it fires bot.on("error") many times in a row
-// (once per retry) with the same invalid_grant message. Our authErrorHandled
-// flag was stored on the activeBots entry — but cleanupBot() removes that
-// entry, so every subsequent retry found entry=undefined, the guard was
-// false, and it re-ran clearAuthCache + cleanupBot 15+ times.
-//
-// Fix: track handled discordIds in a module-level Set that survives cleanup.
-// Entries auto-expire after AUTH_ERROR_DEDUP_TTL_MS so that a fresh /start
-// can always proceed. We also explicitly clear the id at the top of startBot.
 // ============================================================
 const handledAuthErrors = new Set();
 const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -180,15 +168,11 @@ const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
-// VERSION CACHE (best-effort)
-// Keeps track of which protocol version worked per host.
+// VERSION CACHE
 // ============================================================
 const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
-/** @type {Map<string, string>} */
 const versionCache = new Map();
 
-// Versions mineflayer currently supports (newest first).
-// Used to filter out poisoned version-cache entries (e.g. 1.21.8).
 const SUPPORTED_VERSIONS = new Set([
   "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
   "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20",
@@ -210,13 +194,8 @@ function loadVersionCache() {
     const raw = fs.readFileSync(VERSION_CACHE_PATH, "utf8");
     const json = JSON.parse(raw);
     for (const [host, ver] of Object.entries(json || {})) {
-      if (typeof host === "string" && typeof ver === "string") {
-        // Skip any cached version that mineflayer doesn't support — it would cause createBot to throw.
-        if (SUPPORTED_VERSIONS.has(ver)) {
-          versionCache.set(host.toLowerCase(), ver);
-        } else {
-          console.warn(`[botmanager] ⚠️ Skipping unsupported cached version "${ver}" for ${host}`);
-        }
+      if (typeof host === "string" && typeof ver === "string" && SUPPORTED_VERSIONS.has(ver)) {
+        versionCache.set(host.toLowerCase(), ver);
       }
     }
   } catch {
@@ -226,8 +205,7 @@ function loadVersionCache() {
 
 function saveVersionCache() {
   try {
-    const obj = Object.fromEntries(versionCache.entries());
-    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(obj, null, 2), "utf8");
+    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(Object.fromEntries(versionCache.entries()), null, 2), "utf8");
   } catch {
     // ignore
   }
@@ -237,13 +215,11 @@ loadVersionCache();
 
 function getAutoCandidatesForHost(hostLower) {
   if (hostLower === "donutsmp.net" || hostLower.endsWith(".donutsmp.net")) {
-    // DonutSMP is on 1.21.8 (unsupported); try highest supported version first.
     return ["1.21.4", "1.20.4", "1.20.1", "1.19.4"];
   }
   if (hostLower === "hypixel.net" || hostLower.endsWith(".hypixel.net")) {
     return ["1.21.4", "1.20.4", "1.20.1", "1.8.9"];
   }
-  // Generic fallback: prefer newer stable versions.
   return ["1.21.4", "1.20.4", "1.20.1"];
 }
 
@@ -256,14 +232,6 @@ function shouldRotateVersionForReason(text) {
   );
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-/**
- * Parse a Minecraft server address into host + port.
- * Handles: "play.server.net", "play.server.net:25565", "1.2.3.4:19132"
- */
 function parseServerAddress(address) {
   const str = String(address || "").trim();
   const lastColon = str.lastIndexOf(":");
@@ -276,29 +244,67 @@ function parseServerAddress(address) {
   return { host: str, port: 25565 };
 }
 
-/**
- * Shared handler for Microsoft device-code events / callbacks.
- * Ensures each bot instance only emits ONE device code to the VPS / Discord layer.
- */
-function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse) {
+// ============================================================
+// DEVICE CODE HANDLER
+//
+// Called every time prismarine-auth fires onMsaCode.
+//
+// Key responsibilities:
+//   1. Clear stale hash cache files immediately — this prevents
+//      prismarine-auth's retry loop from loading a stale/partial
+//      device_code from the cache and getting "already been used".
+//   2. Reset the spawn timeout to 5 minutes from now — the entry
+//      may have been started with a 45s timeout (if cache existed),
+//      but now we know interactive auth is needed.
+//   3. Always pass the latest code to onDeviceCode — if the retry
+//      loop generates a new code, callers get the updated one.
+// ============================================================
+function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId) {
   const userCode = deviceCodeResponse.user_code;
   const verificationUri = deviceCodeResponse.verification_uri || "https://www.microsoft.com/link";
   const expiresIn = deviceCodeResponse.expires_in || 900;
-  // Enforce a shorter UX window so users don't get stuck with stale/used codes.
   const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
   const effectiveExpiresIn = Math.min(expiresIn, ENFORCED_DEVICE_CODE_TTL_SEC);
 
-  // Find the active entry for this minecraftUser to guard against double-emission.
-  const entry = [...activeBots.values()].find(
+  // ── 1. Clear stale hash files immediately ──────────────────
+  // If we had cached tokens but still got onMsaCode, the cached refresh
+  // token is expired. Clearing the hash files now prevents prismarine-auth's
+  // retry loop from loading stale device_code state on its next iteration,
+  // which would cause "device_code has already been used".
+  clearHashCacheFiles(minecraftUser);
+
+  // ── 2. Reset spawn timeout to 5 minutes ───────────────────
+  // The entry may have a 45s timeout (set because cache looked valid).
+  // Now we know interactive auth is needed — extend to 5 minutes.
+  if (discordId) {
+    const entry = activeBots.get(discordId);
+    if (entry && entry.spawnTimeoutId) {
+      clearTimeout(entry.spawnTimeoutId);
+      entry.spawnTimeoutId = setTimeout(() => {
+        if (!activeBots.has(discordId)) return;
+        const e = activeBots.get(discordId);
+        if (e.status !== "connecting") return;
+        console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 300s (auth) — cleaning up`);
+        e.spawnError =
+          "Authentication failed, timed out — the Microsoft device code was not redeemed in time. " +
+          "Ask the user to run the command again to get a new code.";
+        e.status = "error";
+        setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
+      }, 5 * 60 * 1000);
+    }
+  }
+
+  // ── 3. Find entry and track device code ───────────────────
+  const entry = discordId ? activeBots.get(discordId) : [...activeBots.values()].find(
     (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
   );
 
   if (entry) {
-    if (entry.deviceCodeEmitted) {
-      console.log(`[botmanager] 🔐 Ignoring regenerated device code for ${minecraftUser} (one already emitted for this bot).`);
-      return;
+    if (!entry.deviceCodeEmitted) {
+      entry.deviceCodeEmitted = true;
     }
-    entry.deviceCodeEmitted = true;
+    // Always update latestDeviceCode so callers can pass the freshest code to the user.
+    entry.latestDeviceCode = userCode;
   }
 
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -321,20 +327,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse) {
 // START BOT
 // ============================================================
 
-/**
- * Start a mineflayer bot for a specific empire member.
- * Uses Microsoft auth (online mode) to join online-mode servers.
- *
- * @param {string}   discordId        - Discord user ID (used as unique key)
- * @param {string}   minecraftUser    - Minecraft username from members.json
- * @param {string}   serverAddress    - Target server (host[:port])
- * @param {string}   version          - Minecraft version (e.g. "1.20.1") or "auto"
- * @param {Function} [onDeviceCode]   - Optional callback(userCode, verificationUri, expiresIn)
- *                                      called when Microsoft device-code auth is needed.
- * @param {Function} [onLinkVerified] - Optional callback(discordId, verifiedMcUsername)
- *                                      called when bot logs in; used for /link verification.
- * @returns {{ success: boolean, reason?: string }}
- */
 function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
@@ -344,10 +336,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   console.log(`  Version:      ${version}`);
   console.log(`  Auth mode:    microsoft`);
 
-  // Clear any stale auth-error dedup guard from a previous failed attempt.
   handledAuthErrors.delete(discordId);
 
-  // Check: already has a bot running
   if (activeBots.has(discordId)) {
     const existing = activeBots.get(discordId);
     console.warn(`[botmanager] ⚠️ User already has an active bot on ${existing.serverHost}:${existing.serverPort}`);
@@ -355,7 +345,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     return { success: false, reason: "already_running", serverAddress: `${existing.serverHost}:${existing.serverPort}` };
   }
 
-  // Check: max bot cap
   if (MAX_BOTS > 0 && activeBots.size >= MAX_BOTS) {
     console.warn(`[botmanager] ⚠️ Max bot limit reached (${MAX_BOTS})`);
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -371,13 +360,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let effectiveVersion = autoMode ? (cached || autoCandidates[0] || "1.20.4") : requestedVersion;
 
   const linkOnly = typeof onLinkVerified === "function";
-
-  // Ensure the per-account token directory exists before passing it to mineflayer.
   const profilesFolder = ensureAccountDir(minecraftUser);
 
-  // Check if Microsoft auth is already cached for this specific account.
-  // loadToken() checks inside the account's own isolated directory, so there
-  // is no risk of finding another account's cache files here.
   const cachedToken = loadToken(minecraftUser);
   const needsInteractiveAuth = !cachedToken;
 
@@ -395,23 +379,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       username: minecraftUser,
       version: effectiveVersion,
       auth: "microsoft",
-      // Per-account isolated directory — prismarine-auth reads/writes all its
-      // cache files here. This prevents any cross-account token contamination
-      // that would cause invalid_grant errors on a fresh device-code flow.
       profilesFolder,
       hideErrors: false,
       logErrors: true,
-      // Hook into prismarine-auth device-code callback so the VPS API
-      // can relay the link + code back to the Discord bot.
       onMsaCode: (deviceCodeResponse) => {
-        handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse);
+        handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId);
       },
     });
   } catch (err) {
     console.error(`[botmanager] ❌ Failed to create bot:`, err.message);
-
-    // If the version is unsupported (e.g. server reports 1.21.8 but mineflayer tops at 1.21.4),
-    // evict the bad version from our cache so the next auto-mode attempt uses the next candidate.
     const errLower = (err.message || "").toLowerCase();
     if (autoMode && (errLower.includes("not supported") || errLower.includes("unsupported version"))) {
       if (versionCache.has(hostLower)) {
@@ -420,12 +396,16 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         saveVersionCache();
       }
     }
-
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "bot_creation_failed", error: err.message };
   }
 
-  // Store in registry immediately so concurrent start calls are blocked.
+  // ── Spawn timeout ──────────────────────────────────────────
+  // Set to 45s if tokens are cached (fast path), or 5 min if auth needed.
+  // handleDeviceCode() will reset this to 5 min if onMsaCode fires
+  // unexpectedly (e.g. cached refresh token was expired).
+  const spawnTimeoutMs = (linkOnly || needsInteractiveAuth) ? 5 * 60 * 1000 : 45 * 1000;
+
   const entry = {
     bot,
     discordId,
@@ -445,16 +425,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     linkVerifiedSent: false,
     deviceCodeEmitted: false,
     deviceCodeExpired: false,
-    // Track pre-spawn socketClosed reconnect attempts to avoid infinite loop
-    // when the server keeps rejecting the connection (e.g. version mismatch).
+    latestDeviceCode: null,
     socketClosedReconnects: 0,
     everSpawned: false,
+    spawnTimeoutId: null, // stored so handleDeviceCode can reset it
   };
   activeBots.set(discordId, entry);
 
-  // Spawn timeout — if bot doesn't fire "spawn" within the window, mark as failed.
-  // For Microsoft device-code auth (or link-only verification), allow time for the user to sign in.
-  const spawnTimeoutMs = (linkOnly || needsInteractiveAuth) ? 5 * 60 * 1000 : 45 * 1000;
   const spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(discordId)) return;
     const e = activeBots.get(discordId);
@@ -463,7 +440,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     const seconds = Math.floor(spawnTimeoutMs / 1000);
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${seconds}s — cleaning up`);
 
-    // If we already showed a device code but never reached login, treat as auth timeout.
     if (e.deviceCodeEmitted && !e.linkVerifiedSent) {
       e.spawnError =
         "Authentication failed, timed out — the Microsoft device code was not redeemed in time. " +
@@ -478,17 +454,18 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
   }, spawnTimeoutMs);
 
-  // Legacy event (some mineflayer versions fire this) — keep for logging
+  // Store on entry so handleDeviceCode can cancel and replace it
+  entry.spawnTimeoutId = spawnTimeoutId;
+
+  // Legacy event
   bot.on("microsoft_device_code", (deviceCodeResponse) => {
-    handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse);
+    handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId);
   });
 
   // ============================================================
   // BOT EVENTS
   // ============================================================
 
-  // For link verification we consider auth complete as soon as the client logs in.
-  // Some servers (limbo/proxy) can authenticate but delay the "spawn" event.
   bot.once("login", () => {
     const e = activeBots.get(discordId);
     if (!e) return;
@@ -496,7 +473,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     e.linkVerifiedSent = true;
     e.status = "online";
     e.spawnError = null;
-    clearTimeout(spawnTimeoutId);
+    if (e.spawnTimeoutId) clearTimeout(e.spawnTimeoutId);
 
     const verifiedName = bot.username || minecraftUser;
     try {
@@ -508,31 +485,31 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   });
 
   bot.once("spawn", () => {
-    clearTimeout(spawnTimeoutId);
-    console.log(`[botmanager] ✅ Bot spawned: ${minecraftUser} on ${host}:${port}`);
     const currentEntry = activeBots.get(discordId);
+    if (currentEntry && currentEntry.spawnTimeoutId) {
+      clearTimeout(currentEntry.spawnTimeoutId);
+    }
+    console.log(`[botmanager] ✅ Bot spawned: ${minecraftUser} on ${host}:${port}`);
     if (currentEntry) {
       currentEntry.status = "online";
       currentEntry.spawnError = null;
       currentEntry.everSpawned = true;
-      currentEntry.socketClosedReconnects = 0; // reset counter after a successful spawn
+      currentEntry.socketClosedReconnects = 0;
     }
 
-    // Cache the working version for this host (auto-mode only).
     if (autoMode) {
       versionCache.set(hostLower, effectiveVersion);
       saveVersionCache();
     }
 
-    // Write our marker file so future loadToken() calls correctly detect
-    // that prismarine-auth has cached credentials for this account.
     saveToken(minecraftUser);
   });
 
   bot.on("kicked", (reason) => {
-    clearTimeout(spawnTimeoutId);
-    let reasonText;
+    const currentEntry = activeBots.get(discordId);
+    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
 
+    let reasonText;
     if (typeof reason === "string") {
       try {
         const parsed = JSON.parse(reason);
@@ -541,11 +518,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         reasonText = reason;
       }
     } else if (reason && typeof reason === "object") {
-      reasonText =
-        reason.text ||
-        reason.translate ||
-        reason.reason ||
-        JSON.stringify(reason);
+      reasonText = reason.text || reason.translate || reason.reason || JSON.stringify(reason);
     } else {
       reasonText = String(reason);
     }
@@ -556,15 +529,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       activeBots.get(discordId).status = "error";
     }
 
-    // Auto version rotation for protocol/decoder desync
     if (autoMode && shouldRotateVersionForReason(reasonText)) {
       const e = activeBots.get(discordId);
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
       const nextVersion = e?.autoCandidates?.[nextIndex];
       if (nextVersion) {
-        console.warn(
-          `[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`,
-        );
+        console.warn(`[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`);
         setTimeout(() => {
           cleanupBot(discordId, "auto_version_retry_kicked");
           versionCache.set(hostLower, nextVersion);
@@ -579,39 +549,25 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   });
 
   bot.on("error", (err) => {
-    clearTimeout(spawnTimeoutId);
+    const currentEntry = activeBots.get(discordId);
+    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
 
-    // ── AUTH ERROR DEDUP GUARD ────────────────────────────────
-    // prismarine-auth has an internal retry loop. When a device code
-    // expires or is rejected, it fires bot.on("error") many times in a row
-    // (once per retry) with the same invalid_grant message. Our authErrorHandled
-    // flag was stored on the activeBots entry — but cleanupBot() removes that
-    // entry, so every subsequent retry found entry=undefined, the guard was
-    // false, and it re-ran clearAuthCache + cleanupBot 15+ times.
-    //
-    // This module-level Set survives cleanupBot(), so we catch all retries.
     if (handledAuthErrors.has(discordId)) {
-      // Swallow silently — already handled this auth failure.
       return;
     }
-    // ─────────────────────────────────────────────────────────
 
     console.error(`[botmanager] ❌ Bot error: ${minecraftUser} — ${err.message}`);
-    const currentEntry = activeBots.get(discordId);
     if (currentEntry) {
       currentEntry.spawnError = err.message;
       currentEntry.status = "error";
     }
 
-    // Auto version rotation for protocol/decoder desync
     if (autoMode && shouldRotateVersionForReason(err.message) && !(currentEntry && currentEntry.deviceCodeEmitted)) {
       const e = activeBots.get(discordId);
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
       const nextVersion = e?.autoCandidates?.[nextIndex];
       if (nextVersion) {
-        console.warn(
-          `[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`,
-        );
+        console.warn(`[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`);
         setTimeout(() => {
           cleanupBot(discordId, "auto_version_retry_error");
           versionCache.set(hostLower, nextVersion);
@@ -622,8 +578,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     }
 
-    // If it's ANY auth-related error (including invalid_grant), clear the auth cache
-    // for this account only, so the next attempt does a fresh device-code flow.
     const msgLower = (err.message || "").toLowerCase();
     const isAuthError =
       msgLower.includes("invalid_grant") ||
@@ -636,9 +590,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       msgLower.includes("msa");
 
     if (isAuthError) {
-      // Mark as handled in the module-level Set BEFORE cleanup so that any
-      // synchronous or near-synchronous re-fires from prismarine-auth's retry
-      // loop are immediately dropped. Auto-expire after TTL so re-starts work.
       handledAuthErrors.add(discordId);
       setTimeout(() => handledAuthErrors.delete(discordId), AUTH_ERROR_DEDUP_TTL_MS);
 
@@ -653,7 +604,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           "Ask the user to run the command again to get a new device code.";
       }
 
-      // Stop immediately to avoid repeatedly reusing a redeemed/invalid device_code.
       cleanupBot(discordId, "auth_error");
       return;
     }
@@ -662,23 +612,19 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   });
 
   bot.on("end", (reason) => {
-    clearTimeout(spawnTimeoutId);
+    const currentEntry = activeBots.get(discordId);
+    if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
+
     console.log(`[botmanager] 🔌 Bot disconnected: ${minecraftUser} — reason: ${reason}`);
 
     if (AUTO_RECONNECT && activeBots.has(discordId)) {
       const e = activeBots.get(discordId);
 
-      // If the bot never successfully spawned and keeps getting socketClosed,
-      // it means the server is rejecting us (version mismatch, rate limit, etc.).
-      // After 3 pre-spawn failures, give up and mark as error.
       const MAX_PRESPAWN_RECONNECTS = 3;
       if (!e.everSpawned && reason === "socketClosed") {
         e.socketClosedReconnects = (e.socketClosedReconnects || 0) + 1;
         if (e.socketClosedReconnects >= MAX_PRESPAWN_RECONNECTS) {
-          console.warn(
-            `[botmanager] ⛔ ${minecraftUser} hit ${MAX_PRESPAWN_RECONNECTS} socketClosed failures before spawning — giving up. ` +
-            `Server may be running an unsupported version or is rejecting the client.`
-          );
+          console.warn(`[botmanager] ⛔ ${minecraftUser} hit ${MAX_PRESPAWN_RECONNECTS} socketClosed failures before spawning — giving up.`);
           e.status = "error";
           e.spawnError =
             `The server closed the connection ${MAX_PRESPAWN_RECONNECTS} times before the bot could spawn. ` +
@@ -713,14 +659,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 }
 
 // ============================================================
-// STOP BOT
+// STOP / CLEANUP
 // ============================================================
 
-/**
- * Stop a specific user's bot.
- * @param {string} discordId
- * @returns {{ success: boolean, reason?: string }}
- */
 function stopBot(discordId) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🛑 Stopping bot for discordId: ${discordId}`);
@@ -738,14 +679,6 @@ function stopBot(discordId) {
   return { success: true };
 }
 
-// ============================================================
-// STOP ALL BOTS
-// ============================================================
-
-/**
- * Stop all running bots.
- * @returns {{ success: boolean, stopped: number }}
- */
 function stopAllBots() {
   const count = activeBots.size;
   console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
@@ -755,23 +688,19 @@ function stopAllBots() {
   return { success: true, stopped: count };
 }
 
-// ============================================================
-// CLEANUP (internal)
-// ============================================================
-
 function cleanupBot(discordId, reason) {
   const entry = activeBots.get(discordId);
   if (!entry) return;
 
+  if (entry.spawnTimeoutId) {
+    clearTimeout(entry.spawnTimeoutId);
+    entry.spawnTimeoutId = null;
+  }
+
   activeBots.delete(discordId);
 
-  try {
-    entry.bot.quit();
-  } catch (_) {}
-
-  try {
-    entry.bot.end();
-  } catch (_) {}
+  try { entry.bot.quit(); } catch (_) {}
+  try { entry.bot.end(); } catch (_) {}
 
   console.log(`[botmanager] 🧹 Cleaned up bot for ${entry.minecraftUser} (reason: ${reason})`);
 }
@@ -780,11 +709,6 @@ function cleanupBot(discordId, reason) {
 // STATUS / LIST
 // ============================================================
 
-/**
- * Get status of a specific user's bot.
- * @param {string} discordId
- * @returns {{ found: boolean, bot?: object }}
- */
 function getBotStatus(discordId) {
   const entry = activeBots.get(discordId);
   if (!entry) return { found: false };
@@ -805,18 +729,10 @@ function getBotStatus(discordId) {
   };
 }
 
-/**
- * Get the count of active bots.
- * @returns {number}
- */
 function getBotCount() {
   return activeBots.size;
 }
 
-/**
- * List all active bots.
- * @returns {Array<object>}
- */
 function listAllBots() {
   return [...activeBots.values()].map((entry) => ({
     discordId: entry.discordId,
