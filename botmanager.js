@@ -1,6 +1,7 @@
 // yazanaki/mcbot/botmanager.js (VPS-side)
 // Manages mineflayer bots with Microsoft auth, device-code relay,
 // link verification, version auto-detection, and auth error dedup.
+// ✅ PATCHED: Ban detection — banned bots stop immediately, no reconnect loop.
 
 "use strict";
 
@@ -211,6 +212,26 @@ function shouldRotateVersionForReason(reasonText) {
 }
 
 // ============================================================
+// ✅ BAN DETECTION
+// Returns true if the kick reason indicates a ban.
+// Never reconnects on a ban — doing so worsens the situation.
+// ============================================================
+
+function isBanKick(reasonText) {
+  const t = (reasonText || "").toLowerCase();
+  return (
+    t.includes("banned") ||
+    t.includes("you are banned") ||
+    t.includes("permanently banned") ||
+    t.includes("tempban") ||
+    t.includes("temp ban") ||
+    t.includes("ip ban") ||
+    t.includes("ipban") ||
+    t.includes("suspended")
+  );
+}
+
+// ============================================================
 // SERVER ADDRESS PARSER
 // ============================================================
 
@@ -329,7 +350,7 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
         "Authentication timed out — the Microsoft device code was not redeemed in time. " +
         "Run /mcbot start again to get a new code.";
       e.status = "error";
-      setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
+      setTimeout(() => cleanupBot(botId, "spawn_timeout"), 0);
     }, 5 * 60 * 1000);
   }
 
@@ -417,6 +438,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     startedAt: new Date().toISOString(),
     status: "connecting",
     spawnError: null,
+    errorCategory: null,
     spawnTimeoutId: null,
     deviceCodeEmitted: false,
     bot: null,
@@ -488,6 +510,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
 
+      // ── ✅ Ban detection — never reconnect on a ban ────────
+      if (isBanKick(reasonText)) {
+        console.error(`[botmanager] 🚫 Ban detected for ${minecraftUser} — stopping permanently`);
+        const e = activeBots.get(botId);
+        e.status = "error";
+        e.errorCategory = "banned";
+        e.spawnError = `Banned from server: ${reasonText}`;
+        cleanupBot(botId, "banned");
+        return;
+      }
+
       if (autoMode && shouldRotateVersionForReason(reasonText)) {
         autoVersionIndex++;
         if (autoVersionIndex < autoCandidates.length) {
@@ -542,8 +575,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
         clearAuthCache(minecraftUser);
         e.status = "error";
-        e.spawnError = "Microsoft authentication failed. Run /mcbot start again to sign in.";
         e.errorCategory = "auth_error";
+        e.spawnError = "Microsoft authentication failed. Run /mcbot start again to sign in.";
         cleanupBot(botId, "auth_error");
         return;
       }
@@ -682,15 +715,16 @@ function getBotStatus(discordId, minecraftUser) {
   return {
     found: true,
     bot: {
-      botId: entry.botId,
-      discordId: entry.discordId,
+      botId:         entry.botId,
+      discordId:     entry.discordId,
       minecraftUser: entry.minecraftUser,
-      serverHost: entry.serverHost,
-      serverPort: entry.serverPort,
-      version: entry.version,
-      startedAt: entry.startedAt,
-      status: entry.status,
-      spawnError: entry.spawnError || null,
+      serverHost:    entry.serverHost,
+      serverPort:    entry.serverPort,
+      version:       entry.version,
+      startedAt:     entry.startedAt,
+      status:        entry.status,
+      errorCategory: entry.errorCategory || null,
+      spawnError:    entry.spawnError || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
     },
   };
@@ -705,15 +739,16 @@ function getBotsForUser(discordId) {
   for (const [botId, entry] of activeBots.entries()) {
     if (botId.startsWith(prefix)) {
       bots.push({
-        botId: entry.botId,
-        discordId: entry.discordId,
+        botId:         entry.botId,
+        discordId:     entry.discordId,
         minecraftUser: entry.minecraftUser,
-        serverHost: entry.serverHost,
-        serverPort: entry.serverPort,
-        version: entry.version,
-        startedAt: entry.startedAt,
-        status: entry.status,
-        spawnError: entry.spawnError || null,
+        serverHost:    entry.serverHost,
+        serverPort:    entry.serverPort,
+        version:       entry.version,
+        startedAt:     entry.startedAt,
+        status:        entry.status,
+        errorCategory: entry.errorCategory || null,
+        spawnError:    entry.spawnError || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       });
     }
@@ -727,14 +762,14 @@ function getBotCount() {
 
 function listAllBots() {
   return [...activeBots.values()].map((entry) => ({
-    botId: entry.botId,
-    discordId: entry.discordId,
+    botId:         entry.botId,
+    discordId:     entry.discordId,
     minecraftUser: entry.minecraftUser,
-    serverHost: entry.serverHost,
-    serverPort: entry.serverPort,
-    version: entry.version,
-    startedAt: entry.startedAt,
-    status: entry.status,
+    serverHost:    entry.serverHost,
+    serverPort:    entry.serverPort,
+    version:       entry.version,
+    startedAt:     entry.startedAt,
+    status:        entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
   }));
 }
