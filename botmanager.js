@@ -121,37 +121,6 @@ function clearAuthCache(username) {
   }
 }
 
-/**
- * Clear ONLY the prismarine-auth hash-prefixed cache files for an account.
- * Leaves _marker.json intact.
- *
- * Called when onMsaCode fires despite having cached tokens — this means
- * the cached refresh token expired. Clearing the hash files prevents
- * prismarine-auth's retry loop from loading stale device_code data from
- * the cache and getting "device_code has already been used".
- */
-function clearHashCacheFiles(username) {
-  const dir = accountTokenDir(username);
-  if (!fs.existsSync(dir)) return;
-
-  try {
-    const files = fs.readdirSync(dir);
-    const cachePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
-    for (const file of files) {
-      if (cachePattern.test(file)) {
-        try {
-          fs.unlinkSync(path.join(dir, file));
-          console.log(`[botmanager] 🧹 Cleared stale hash cache: ${username}/${file}`);
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-}
-
 // ============================================================
 // IN-MEMORY BOT REGISTRY
 // ============================================================
@@ -247,17 +216,16 @@ function parseServerAddress(address) {
 // ============================================================
 // DEVICE CODE HANDLER
 //
-// Called every time prismarine-auth fires onMsaCode.
+// prismarine-auth fires onMsaCode once to ask the user to sign in,
+// then internally retries polling Microsoft. If the first attempt
+// fails (e.g. expired cached tokens triggered a fallback to device
+// code), it fires onMsaCode AGAIN with a new code.
 //
-// Key responsibilities:
-//   1. Clear stale hash cache files immediately — this prevents
-//      prismarine-auth's retry loop from loading a stale/partial
-//      device_code from the cache and getting "already been used".
-//   2. Reset the spawn timeout to 5 minutes from now — the entry
-//      may have been started with a 45s timeout (if cache existed),
-//      but now we know interactive auth is needed.
-//   3. Always pass the latest code to onDeviceCode — if the retry
-//      loop generates a new code, callers get the updated one.
+// We intentionally do NOT support auto-retry. If onMsaCode fires
+// more than once for the same bot session, we kill the bot
+// immediately and tell the user to run /mcbot start again.
+// This is cleaner than showing a confusing "updated code" DM and
+// prevents the invalid_grant retry spam loop entirely.
 // ============================================================
 function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId) {
   const userCode = deviceCodeResponse.user_code;
@@ -266,45 +234,57 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
   const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
   const effectiveExpiresIn = Math.min(expiresIn, ENFORCED_DEVICE_CODE_TTL_SEC);
 
-  // ── 1. Clear stale hash files immediately ──────────────────
-  // If we had cached tokens but still got onMsaCode, the cached refresh
-  // token is expired. Clearing the hash files now prevents prismarine-auth's
-  // retry loop from loading stale device_code state on its next iteration,
-  // which would cause "device_code has already been used".
-  clearHashCacheFiles(minecraftUser);
-
-  // ── 2. Reset spawn timeout to 5 minutes ───────────────────
-  // The entry may have a 45s timeout (set because cache looked valid).
-  // Now we know interactive auth is needed — extend to 5 minutes.
-  if (discordId) {
-    const entry = activeBots.get(discordId);
-    if (entry && entry.spawnTimeoutId) {
-      clearTimeout(entry.spawnTimeoutId);
-      entry.spawnTimeoutId = setTimeout(() => {
-        if (!activeBots.has(discordId)) return;
-        const e = activeBots.get(discordId);
-        if (e.status !== "connecting") return;
-        console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 300s (auth) — cleaning up`);
-        e.spawnError =
-          "Authentication failed, timed out — the Microsoft device code was not redeemed in time. " +
-          "Ask the user to run the command again to get a new code.";
-        e.status = "error";
-        setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
-      }, 5 * 60 * 1000);
-    }
-  }
-
-  // ── 3. Find entry and track device code ───────────────────
   const entry = discordId ? activeBots.get(discordId) : [...activeBots.values()].find(
     (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
   );
 
-  if (entry) {
-    if (!entry.deviceCodeEmitted) {
-      entry.deviceCodeEmitted = true;
+  // ── Guard: kill immediately if a second code fires ─────────
+  // prismarine-auth's retry loop fires onMsaCode again after the
+  // first code's poll fails. We don't support this — kill the bot
+  // so the user gets a clean "run /mcbot start again" message
+  // instead of an invalid_grant spam loop.
+  if (entry && entry.deviceCodeEmitted) {
+    console.warn(`[botmanager] 🛑 Second device code fired for ${minecraftUser} — killing bot. User must run /mcbot start again.`);
+
+    // Clear the bad auth cache so next attempt starts fully fresh
+    clearAuthCache(minecraftUser);
+
+    if (entry.spawnTimeoutId) {
+      clearTimeout(entry.spawnTimeoutId);
+      entry.spawnTimeoutId = null;
     }
-    // Always update latestDeviceCode so callers can pass the freshest code to the user.
-    entry.latestDeviceCode = userCode;
+    entry.status = "error";
+    entry.spawnError =
+      "Microsoft authentication failed — the sign-in session could not be completed. " +
+      "Please run /mcbot start again to receive a fresh login code.";
+
+    // Use setTimeout to avoid calling cleanupBot synchronously inside onMsaCode
+    if (discordId) {
+      setTimeout(() => cleanupBot(discordId, "auth_second_code"), 0);
+    }
+    return;
+  }
+
+  // ── First code — mark as emitted and extend spawn timeout ──
+  if (entry) {
+    entry.deviceCodeEmitted = true;
+
+    // Reset spawn timeout to 5 minutes from now so the user has time to sign in.
+    // (The original timeout may have been 45s if cached tokens were detected.)
+    if (entry.spawnTimeoutId) {
+      clearTimeout(entry.spawnTimeoutId);
+    }
+    entry.spawnTimeoutId = setTimeout(() => {
+      if (!activeBots.has(discordId)) return;
+      const e = activeBots.get(discordId);
+      if (e.status !== "connecting") return;
+      console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 300s (auth) — cleaning up`);
+      e.spawnError =
+        "Authentication timed out — the Microsoft device code was not redeemed in time. " +
+        "Run /mcbot start again to get a new code.";
+      e.status = "error";
+      setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
+    }, 5 * 60 * 1000);
   }
 
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -400,10 +380,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     return { success: false, reason: "bot_creation_failed", error: err.message };
   }
 
-  // ── Spawn timeout ──────────────────────────────────────────
-  // Set to 45s if tokens are cached (fast path), or 5 min if auth needed.
-  // handleDeviceCode() will reset this to 5 min if onMsaCode fires
-  // unexpectedly (e.g. cached refresh token was expired).
+  // Spawn timeout — 45s if tokens are cached (fast path), 5 min if auth needed.
+  // handleDeviceCode() resets this to 5 min if onMsaCode fires on a cached-token bot.
   const spawnTimeoutMs = (linkOnly || needsInteractiveAuth) ? 5 * 60 * 1000 : 45 * 1000;
 
   const entry = {
@@ -425,10 +403,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     linkVerifiedSent: false,
     deviceCodeEmitted: false,
     deviceCodeExpired: false,
-    latestDeviceCode: null,
     socketClosedReconnects: 0,
     everSpawned: false,
-    spawnTimeoutId: null, // stored so handleDeviceCode can reset it
+    spawnTimeoutId: null,
   };
   activeBots.set(discordId, entry);
 
@@ -442,8 +419,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
     if (e.deviceCodeEmitted && !e.linkVerifiedSent) {
       e.spawnError =
-        "Authentication failed, timed out — the Microsoft device code was not redeemed in time. " +
-        "Ask the user to run the command again to get a new code.";
+        "Authentication timed out — the Microsoft device code was not redeemed in time. " +
+        "Run /mcbot start again to get a new code.";
     } else {
       e.spawnError =
         `Connection timed out — the server did not respond within ${seconds} seconds. ` +
@@ -454,7 +431,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     setTimeout(() => cleanupBot(discordId, "spawn_timeout"), 30000);
   }, spawnTimeoutMs);
 
-  // Store on entry so handleDeviceCode can cancel and replace it
   entry.spawnTimeoutId = spawnTimeoutId;
 
   // Legacy event
@@ -534,7 +510,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
       const nextVersion = e?.autoCandidates?.[nextIndex];
       if (nextVersion) {
-        console.warn(`[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`);
+        console.warn(`[botmanager] 🔁 Auto-version retry: ${effectiveVersion} → ${nextVersion} (reason: ${reasonText})`);
         setTimeout(() => {
           cleanupBot(discordId, "auto_version_retry_kicked");
           versionCache.set(hostLower, nextVersion);
@@ -567,7 +543,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
       const nextVersion = e?.autoCandidates?.[nextIndex];
       if (nextVersion) {
-        console.warn(`[botmanager] 🔁 Auto-version retry for ${minecraftUser}: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`);
+        console.warn(`[botmanager] 🔁 Auto-version retry: ${effectiveVersion} → ${nextVersion} (error: ${err.message})`);
         setTimeout(() => {
           cleanupBot(discordId, "auto_version_retry_error");
           versionCache.set(hostLower, nextVersion);
@@ -600,8 +576,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (e) {
         e.deviceCodeExpired = true;
         e.spawnError =
-          "Authentication failed — Microsoft sign-in did not complete or was rejected. " +
-          "Ask the user to run the command again to get a new device code.";
+          "Microsoft authentication failed — the sign-in session could not be completed. " +
+          "Run /mcbot start again to get a fresh login code.";
       }
 
       cleanupBot(discordId, "auth_error");
