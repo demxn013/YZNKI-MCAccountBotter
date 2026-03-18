@@ -19,12 +19,13 @@ const path = require("path");
 // the `profilesFolder` option passed to mineflayer.createBot().
 //
 // This isolation means:
-//   - Cache files from account A can never bleed into account B.
+//   - Cache files from account A can NEVER bleed into account B.
 //   - invalid_grant from a consumed/stale device_code belonging to
-//     a different account is fully prevented.
+//     a different account is fully prevented at the source.
 //   - loadToken() can safely check for hash files because any files
 //     inside tokens/<username>/ are guaranteed to belong to that account.
-//   - clearAuthCache() only ever touches that account's directory.
+//   - clearAuthCache() only ever touches that account's directory,
+//     leaving all other accounts' tokens intact.
 // ============================================================
 const TOKENS_ROOT = path.join(__dirname, "tokens");
 
@@ -49,7 +50,7 @@ function markerPath(username) {
 }
 
 /**
- * Ensure the per-account token directory exists.
+ * Ensure the per-account token directory exists and return its path.
  */
 function ensureAccountDir(username) {
   const dir = accountTokenDir(username);
@@ -122,7 +123,7 @@ function saveToken(username) {
 
 /**
  * Clear ALL Microsoft auth state for a specific account.
- * Only touches that account's own subdirectory — other accounts are unaffected.
+ * Only touches that account's own subdirectory — other accounts are completely unaffected.
  */
 function clearAuthCache(username) {
   const dir = accountTokenDir(username);
@@ -381,7 +382,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   const needsInteractiveAuth = !cachedToken;
 
   if (cachedToken) {
-    console.log(`[botmanager] 🔑 Using cached Microsoft token for ${minecraftUser}`);
+    console.log(`[botmanager] 🔑 Using cached Microsoft token for ${minecraftUser} (${profilesFolder})`);
   } else {
     console.log(`[botmanager] 🔑 No cached token for ${minecraftUser} — device code auth will be required`);
   }
@@ -621,7 +622,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     }
 
-    // If it's ANY auth-related error (including invalid_grant), clear the FULL auth cache
+    // If it's ANY auth-related error (including invalid_grant), clear the auth cache
     // for this account only, so the next attempt does a fresh device-code flow.
     const msgLower = (err.message || "").toLowerCase();
     const isAuthError =
