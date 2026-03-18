@@ -2,6 +2,7 @@
 // Manages mineflayer bots with Microsoft auth, device-code relay,
 // link verification, version auto-detection, and auth error dedup.
 // ✅ PATCHED: Ban detection — banned bots stop immediately, no reconnect loop.
+// ✅ PATCHED: Anti-fingerprinting — realistic client settings + subtle look drift.
 
 "use strict";
 
@@ -232,6 +233,110 @@ function isBanKick(reasonText) {
 }
 
 // ============================================================
+// ✅ ANTI-FINGERPRINTING — CLIENT SETTINGS
+//
+// A vanilla client sends a settings packet immediately after login
+// declaring render distance, skin layers, locale, etc.
+// Mineflayer does not send this automatically with realistic values,
+// which creates a detectable fingerprint on anti-cheat systems.
+//
+// skinParts bitmask (all 7 layers enabled = 127):
+//   0x01 Cape | 0x02 Jacket | 0x04 Left Sleeve | 0x08 Right Sleeve
+//   0x10 Left Pants | 0x20 Right Pants | 0x40 Hat
+// ============================================================
+
+const COMMON_LOCALES = ["en_US", "en_GB", "en_AU", "en_CA", "en_NZ"];
+
+function sendClientSettings(bot, minecraftUser) {
+  try {
+    // Randomise locale and render distance slightly — real players vary
+    const locale       = COMMON_LOCALES[Math.floor(Math.random() * COMMON_LOCALES.length)];
+    const viewDistance = 8 + Math.floor(Math.random() * 5); // 8–12, realistic for a casual player
+
+    bot._client.write("settings", {
+      locale,
+      viewDistance,
+      chatFlags:           0,     // Chat enabled
+      chatColors:          true,
+      skinParts:           127,   // All skin layers visible
+      mainHand:            1,     // Right hand
+      enableTextFiltering: false,
+      allowServerListings: true,
+    });
+
+    console.log(`[botmanager] 🎮 Client settings sent for ${minecraftUser} (locale: ${locale}, view: ${viewDistance})`);
+  } catch (err) {
+    // Non-fatal — older server versions may not support all fields
+    console.warn(`[botmanager] ⚠️ Could not send client settings for ${minecraftUser}:`, err.message);
+  }
+}
+
+// ============================================================
+// ✅ ANTI-FINGERPRINTING — SUBTLE LOOK DRIFT
+//
+// A bot sitting perfectly still with zero rotation changes is an
+// immediate red flag for any anti-cheat. Real AFK players still
+// have tiny involuntary mouse drift. This schedules very small
+// random yaw/pitch adjustments every 25–60 seconds.
+//
+// Adjustments are kept tiny (≤5° yaw, ≤2° pitch) so they look
+// like idle mouse drift rather than deliberate movement.
+// ============================================================
+
+const LOOK_INTERVAL_MIN_MS = 25000; // 25 seconds
+const LOOK_INTERVAL_MAX_MS = 60000; // 60 seconds
+const DEG_TO_RAD           = Math.PI / 180;
+
+function startSubtleLookDrift(bot, botId, minecraftUser) {
+  function scheduleDrift() {
+    if (!activeBots.has(botId)) return;
+
+    const delay = LOOK_INTERVAL_MIN_MS +
+      Math.random() * (LOOK_INTERVAL_MAX_MS - LOOK_INTERVAL_MIN_MS);
+
+    const timeoutId = setTimeout(() => {
+      if (!activeBots.has(botId)) return;
+      const e = activeBots.get(botId);
+      if (e.status !== "online" || !e.bot) return;
+
+      try {
+        const currentYaw   = e.bot.entity.yaw;
+        const currentPitch = e.bot.entity.pitch;
+
+        // ±5° yaw drift, ±2° pitch drift — imperceptible but present
+        const yawDelta   = (Math.random() * 10 - 5)  * DEG_TO_RAD;
+        const pitchDelta = (Math.random() * 4  - 2)  * DEG_TO_RAD;
+
+        const newYaw   = currentYaw + yawDelta;
+        const newPitch = Math.max(-1.5, Math.min(1.5, currentPitch + pitchDelta));
+
+        e.bot.look(newYaw, newPitch, false);
+      } catch (_) {
+        // Bot may be mid-reconnect — silently skip
+      }
+
+      // Schedule next drift
+      scheduleDrift();
+    }, delay);
+
+    // Store so cleanupBot can cancel it
+    if (activeBots.has(botId)) {
+      activeBots.get(botId)._lookTimeoutId = timeoutId;
+    }
+  }
+
+  // Small random delay before first drift so bots don't all drift in sync
+  const initialDelay = 5000 + Math.random() * 10000;
+  setTimeout(() => {
+    if (activeBots.has(botId) && activeBots.get(botId).status === "online") {
+      scheduleDrift();
+    }
+  }, initialDelay);
+
+  console.log(`[botmanager] 👁️ Look drift started for ${minecraftUser}`);
+}
+
+// ============================================================
 // SERVER ADDRESS PARSER
 // ============================================================
 
@@ -302,7 +407,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
     user_code: userCode,
     verification_uri: verificationUri,
     expires_in: expiresIn,
-    interval,
   } = deviceCodeResponse;
 
   const effectiveExpiresIn = expiresIn || 900;
@@ -432,16 +536,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     botId,
     discordId,
     minecraftUser,
-    serverHost: host,
-    serverPort: port,
-    version: effectiveVersion,
-    startedAt: new Date().toISOString(),
-    status: "connecting",
-    spawnError: null,
-    errorCategory: null,
-    spawnTimeoutId: null,
+    serverHost:        host,
+    serverPort:        port,
+    version:           effectiveVersion,
+    startedAt:         new Date().toISOString(),
+    status:            "connecting",
+    spawnError:        null,
+    errorCategory:     null,
+    spawnTimeoutId:    null,
+    _lookTimeoutId:    null, // ✅ look drift timeout handle
     deviceCodeEmitted: false,
-    bot: null,
+    bot:               null,
   };
 
   activeBots.set(botId, entry);
@@ -466,11 +571,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       bot = mineflayer.createBot({
         host,
         port,
-        username: minecraftUser,
-        version: versionToTry,
-        auth: "microsoft",
+        username:       minecraftUser,
+        version:        versionToTry,
+        auth:           "microsoft",
         profilesFolder: tokenDir,
-        onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+        onMsaCode:      (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
       });
     } catch (err) {
       console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
@@ -503,6 +608,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (typeof onLinkVerified === "function") {
         try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
       }
+
+      // ✅ ANTI-FINGERPRINTING: Send realistic client settings packet
+      // Small random delay mimics the timing of a real client
+      setTimeout(() => {
+        if (activeBots.has(botId) && activeBots.get(botId).status === "online") {
+          sendClientSettings(bot, minecraftUser);
+        }
+      }, 500 + Math.random() * 1000);
+
+      // ✅ ANTI-FINGERPRINTING: Start subtle look drift
+      startSubtleLookDrift(bot, botId, minecraftUser);
     });
 
     bot.on("kicked", (reason) => {
@@ -553,7 +669,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
 
-      const errCode = err.code;
+      const errCode    = err.code;
       const errMessage = err.message || "";
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
@@ -692,6 +808,12 @@ function cleanupBot(botId, reason) {
     entry.spawnTimeoutId = null;
   }
 
+  // ✅ Cancel any pending look drift timeout
+  if (entry._lookTimeoutId) {
+    clearTimeout(entry._lookTimeoutId);
+    entry._lookTimeoutId = null;
+  }
+
   activeBots.delete(botId);
 
   try { entry.bot.quit(); } catch (_) {}
@@ -735,7 +857,7 @@ function getBotStatus(discordId, minecraftUser) {
  */
 function getBotsForUser(discordId) {
   const prefix = `${discordId}:`;
-  const bots = [];
+  const bots   = [];
   for (const [botId, entry] of activeBots.entries()) {
     if (botId.startsWith(prefix)) {
       bots.push({
