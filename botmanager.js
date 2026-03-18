@@ -174,7 +174,7 @@ function loadVersionCache() {
 
 function saveVersionCache() {
   try {
-    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(Object.fromEntries(versionCache.entries()), null, 2), "utf8");
+    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(Object.fromEntries(versionCache), null, 2), "utf8");
   } catch {
     // ignore
   }
@@ -182,71 +182,118 @@ function saveVersionCache() {
 
 loadVersionCache();
 
+// ============================================================
+// VERSION AUTO-DETECTION HELPERS
+// ============================================================
+
 function getAutoCandidatesForHost(hostLower) {
-  if (hostLower === "donutsmp.net" || hostLower.endsWith(".donutsmp.net")) {
-    return ["1.21.4", "1.20.4", "1.20.1", "1.19.4"];
-  }
-  if (hostLower === "hypixel.net" || hostLower.endsWith(".hypixel.net")) {
-    return ["1.21.4", "1.20.4", "1.20.1", "1.8.9"];
-  }
-  return ["1.21.4", "1.20.4", "1.20.1"];
+  return [
+    "1.21.4", "1.21.1", "1.21",
+    "1.20.6", "1.20.4", "1.20.1",
+    "1.19.4", "1.19.2",
+    "1.18.2", "1.17.1", "1.16.5",
+  ];
 }
 
-function shouldRotateVersionForReason(text) {
-  const lower = String(text || "").toLowerCase();
+function shouldRotateVersionForReason(reasonText) {
+  const t = (reasonText || "").toLowerCase();
   return (
-    lower.includes("chunk size is") ||
-    lower.includes("partial packet") ||
-    lower.includes("invalid sequence")
+    t.includes("outdated") ||
+    t.includes("not supported") ||
+    t.includes("unsupported version") ||
+    t.includes("please update") ||
+    t.includes("wrong version")
   );
 }
 
-function parseServerAddress(address) {
-  const str = String(address || "").trim();
+// ============================================================
+// SERVER ADDRESS PARSER
+// ============================================================
+
+function parseServerAddress(serverAddress) {
+  const str = String(serverAddress || "").trim();
   const lastColon = str.lastIndexOf(":");
-  if (lastColon !== -1 && lastColon < str.length - 1) {
-    const potentialPort = parseInt(str.slice(lastColon + 1), 10);
-    if (!isNaN(potentialPort) && potentialPort > 0 && potentialPort <= 65535) {
-      return { host: str.slice(0, lastColon), port: potentialPort };
-    }
+  if (lastColon === -1) {
+    return { host: str, port: 25565 };
+  }
+  const possiblePort = parseInt(str.slice(lastColon + 1), 10);
+  if (!isNaN(possiblePort) && possiblePort > 0 && possiblePort <= 65535) {
+    return { host: str.slice(0, lastColon), port: possiblePort };
   }
   return { host: str, port: 25565 };
 }
 
 // ============================================================
-// DEVICE CODE HANDLER
-//
-// prismarine-auth fires onMsaCode once to ask the user to sign in,
-// then internally retries polling Microsoft. If the first attempt
-// fails (e.g. expired cached tokens triggered a fallback to device
-// code), it fires onMsaCode AGAIN with a new code.
-//
-// We intentionally do NOT support auto-retry. If onMsaCode fires
-// more than once for the same bot session, we kill the bot
-// immediately and tell the user to run /mcbot start again.
-// This is cleaner than showing a confusing "updated code" DM and
-// prevents the invalid_grant retry spam loop entirely.
+// FATAL ERROR DETECTION
+// Errors that should never trigger a reconnect loop because
+// retrying will never succeed without user intervention.
 // ============================================================
-function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId) {
-  const userCode = deviceCodeResponse.user_code;
-  const verificationUri = deviceCodeResponse.verification_uri || "https://www.microsoft.com/link";
-  const expiresIn = deviceCodeResponse.expires_in || 900;
-  const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
-  const effectiveExpiresIn = Math.min(expiresIn, ENFORCED_DEVICE_CODE_TTL_SEC);
 
-  const entry = discordId ? activeBots.get(discordId) : [...activeBots.values()].find(
-    (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
-  );
+function isFatalNetworkError(errCode, errMessage) {
+  const FATAL_CODES = new Set([
+    "ENOTFOUND",   // DNS resolution failed — hostname doesn't exist
+    "EAI_AGAIN",   // DNS temporarily unavailable (transient but still fatal for loop)
+    "EAI_NONAME",  // DNS name does not exist
+    "ECONNREFUSED",// Port is closed — server is down
+    "ENETUNREACH", // No route to host
+    "EHOSTUNREACH",// Host unreachable
+  ]);
+
+  if (errCode && FATAL_CODES.has(errCode)) return true;
+
+  const msg = (errMessage || "").toLowerCase();
+  if (msg.includes("enotfound") || msg.includes("getaddrinfo")) return true;
+
+  return false;
+}
+
+function getFatalErrorMessage(errCode, errMessage) {
+  if (errCode === "ENOTFOUND" || (errMessage || "").toLowerCase().includes("getaddrinfo")) {
+    return (
+      `The server address could not be resolved (DNS lookup failed for the hostname). ` +
+      `Check that the server address is spelled correctly and is currently online. ` +
+      `Use /mcbot stop and try again with a valid address.`
+    );
+  }
+  if (errCode === "ECONNREFUSED") {
+    return (
+      `The server refused the connection (port is closed or server is offline). ` +
+      `Check that the server is running and the port is correct.`
+    );
+  }
+  if (errCode === "ENETUNREACH" || errCode === "EHOSTUNREACH") {
+    return (
+      `The server is unreachable from this VPS. ` +
+      `The server may be offline or blocking connections from this IP.`
+    );
+  }
+  return `Network error: ${errMessage || errCode}. The server may be offline or unreachable.`;
+}
+
+// ============================================================
+// DEVICE CODE HANDLER
+// ============================================================
+
+function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, discordId) {
+  const {
+    user_code: userCode,
+    verification_uri: verificationUri,
+    expires_in: expiresIn,
+    interval,
+  } = deviceCodeResponse;
+
+  const effectiveExpiresIn = expiresIn || 900;
+
+  const entry = discordId
+    ? activeBots.get(discordId)
+    : [...activeBots.values()].find(
+        (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
+      );
 
   // ── Guard: kill immediately if a second code fires ─────────
-  // prismarine-auth's retry loop fires onMsaCode again after the
-  // first code's poll fails. We don't support this — kill the bot
-  // so the user gets a clean "run /mcbot start again" message
-  // instead of an invalid_grant spam loop.
   if (entry && entry.deviceCodeEmitted) {
     console.warn(`[botmanager] 🛑 Second device code fired for ${minecraftUser} — killing bot. User must run /mcbot start again.`);
 
-    // Clear the bad auth cache so next attempt starts fully fresh
     clearAuthCache(minecraftUser);
 
     if (entry.spawnTimeoutId) {
@@ -258,7 +305,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
       "Microsoft authentication failed — the sign-in session could not be completed. " +
       "Please run /mcbot start again to receive a fresh login code.";
 
-    // Use setTimeout to avoid calling cleanupBot synchronously inside onMsaCode
     if (discordId) {
       setTimeout(() => cleanupBot(discordId, "auth_second_code"), 0);
     }
@@ -269,8 +315,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, disco
   if (entry) {
     entry.deviceCodeEmitted = true;
 
-    // Reset spawn timeout to 5 minutes from now so the user has time to sign in.
-    // (The original timeout may have been 45s if cached tokens were detected.)
     if (entry.spawnTimeoutId) {
       clearTimeout(entry.spawnTimeoutId);
     }
@@ -381,7 +425,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   }
 
   // Spawn timeout — 45s if tokens are cached (fast path), 5 min if auth needed.
-  // handleDeviceCode() resets this to 5 min if onMsaCode fires on a cached-token bot.
   const spawnTimeoutMs = (linkOnly || needsInteractiveAuth) ? 5 * 60 * 1000 : 45 * 1000;
 
   const entry = {
@@ -400,13 +443,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     spawnError: null,
     linkOnly,
     onLinkVerified: linkOnly ? onLinkVerified : null,
-    linkVerifiedSent: false,
-    deviceCodeEmitted: false,
-    deviceCodeExpired: false,
-    socketClosedReconnects: 0,
-    everSpawned: false,
-    spawnTimeoutId: null,
+    fatalError: false, // ✅ Set to true for unrecoverable errors to block reconnect
   };
+
   activeBots.set(discordId, entry);
 
   const spawnTimeoutId = setTimeout(() => {
@@ -414,10 +453,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     const e = activeBots.get(discordId);
     if (e.status !== "connecting") return;
 
-    const seconds = Math.floor(spawnTimeoutMs / 1000);
+    const seconds = Math.round(spawnTimeoutMs / 1000);
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${seconds}s — cleaning up`);
 
-    if (e.deviceCodeEmitted && !e.linkVerifiedSent) {
+    if (needsInteractiveAuth) {
       e.spawnError =
         "Authentication timed out — the Microsoft device code was not redeemed in time. " +
         "Run /mcbot start again to get a new code.";
@@ -471,6 +510,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       currentEntry.spawnError = null;
       currentEntry.everSpawned = true;
       currentEntry.socketClosedReconnects = 0;
+      currentEntry.fatalError = false;
     }
 
     if (autoMode) {
@@ -538,6 +578,20 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       currentEntry.status = "error";
     }
 
+    // ✅ FATAL ERROR GUARD: DNS failures and unreachable hosts must not trigger
+    // the reconnect loop — retrying ENOTFOUND endlessly wastes resources and
+    // spams logs. Mark as fatal so bot.on("end") skips reconnect.
+    if (isFatalNetworkError(err.code, err.message)) {
+      console.warn(`[botmanager] 🚫 Fatal network error for ${minecraftUser} (${err.code || "unknown"}) — disabling reconnect`);
+      if (currentEntry) {
+        currentEntry.fatalError = true;
+        currentEntry.spawnError = getFatalErrorMessage(err.code, err.message);
+        currentEntry.status = "error";
+      }
+      setTimeout(() => cleanupBot(discordId, "fatal_network_error"), 30000);
+      return;
+    }
+
     if (autoMode && shouldRotateVersionForReason(err.message) && !(currentEntry && currentEntry.deviceCodeEmitted)) {
       const e = activeBots.get(discordId);
       const nextIndex = (e?.autoCandidateIndex ?? -1) + 1;
@@ -592,6 +646,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     if (currentEntry && currentEntry.spawnTimeoutId) clearTimeout(currentEntry.spawnTimeoutId);
 
     console.log(`[botmanager] 🔌 Bot disconnected: ${minecraftUser} — reason: ${reason}`);
+
+    // ✅ FATAL ERROR GUARD: If a fatal network error was recorded (e.g. ENOTFOUND),
+    // skip reconnect entirely. The error handler already scheduled a cleanup.
+    if (currentEntry && currentEntry.fatalError) {
+      console.warn(`[botmanager] 🚫 Skipping reconnect for ${minecraftUser} — fatal error flagged (${reason})`);
+      return;
+    }
 
     if (AUTO_RECONNECT && activeBots.has(discordId)) {
       const e = activeBots.get(discordId);
