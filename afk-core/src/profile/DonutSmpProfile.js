@@ -1,13 +1,15 @@
 "use strict";
 
 const { BaseProfile } = require("./BaseProfile");
+const { HungerHandler } = require("../behavior/HungerHandler");
 
 /**
  * DonutSmpProfile
  *
- * Encapsulates DonutSMP-specific quirks. Initial implementation focuses on:
+ * Encapsulates DonutSMP-specific quirks:
  * - Vanilla-like brand and protocol version.
- * - Gentle idle movement to avoid looking like a frozen bot.
+ * - Gentle idle movement (random look) to avoid looking like a frozen bot.
+ * - Automatic hunger management — eats food when a hunger bar is lost.
  * - Hook for future plugin-message handling.
  */
 class DonutSmpProfile extends BaseProfile {
@@ -15,6 +17,7 @@ class DonutSmpProfile extends BaseProfile {
     super("donutsmp", ["1.21.4"]);
     this._lastMoveAt = 0;
     this._versionCache = new Map(); // hostLower -> version
+    this._hungerHandler = null;
   }
 
   _getCandidates() {
@@ -32,7 +35,7 @@ class DonutSmpProfile extends BaseProfile {
     const effectiveVersion =
       requestedVersion === "auto" ? this._resolveAutoVersion(hostLower) : baseOptions.version;
 
-    // Expose on session for status/debug
+    // Expose on session for status/debug and so attachHandlers can read it.
     if (session) {
       session.version = effectiveVersion;
     }
@@ -45,6 +48,11 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   attachHandlers(client, session) {
+    // Initialise hunger handler using the negotiated version.
+    const version = (session && session.version) ? String(session.version) : "1.21.4";
+    this._hungerHandler = new HungerHandler(version);
+    this._hungerHandler.attach(client);
+
     // Placeholder for handling DonutSMP-specific plugin channels.
     client.on("plugin_message", () => {
       // In a future iteration, inspect and respond to channels used by DonutSMP.
@@ -54,7 +62,7 @@ class DonutSmpProfile extends BaseProfile {
     client.on("login", () => {
       const hostLower = String(session?.serverHost || "").toLowerCase();
       if (hostLower) {
-        this._versionCache.set(hostLower, String(session?.version || "1.20.4"));
+        this._versionCache.set(hostLower, String(session?.version || "1.21.4"));
       }
     });
   }
@@ -77,10 +85,15 @@ class DonutSmpProfile extends BaseProfile {
         // Ignore movement errors.
       }
     }
+
+    // Periodic hunger check (reactive eating via update_health handles most cases;
+    // this tick is a safety net for edge cases).
+    if (this._hungerHandler) {
+      this._hungerHandler.tick(client);
+    }
   }
 }
 
 module.exports = {
   DonutSmpProfile,
 };
-

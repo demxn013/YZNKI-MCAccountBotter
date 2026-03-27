@@ -1,8 +1,6 @@
 // yazanaki/mcbot/botmanager.js (VPS-side)
 // Manages mineflayer bots with Microsoft auth, device-code relay,
 // link verification, version auto-detection, and auth error dedup.
-// ✅ PATCHED: Ban detection — banned bots stop immediately, no reconnect loop.
-// ✅ PATCHED: Anti-fingerprinting — realistic client settings + subtle look drift.
 
 "use strict";
 
@@ -189,6 +187,34 @@ function saveVersionCache() {
 loadVersionCache();
 
 // ============================================================
+// HUNGER MANAGEMENT — food items the bot is allowed to eat.
+// Dangerous items (pufferfish, spider_eye, rotten_flesh,
+// poisonous_potato) are intentionally excluded.
+// ============================================================
+const BOT_FOOD_ITEMS = new Set([
+  // Cooked meats (preferred — high saturation)
+  "cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton",
+  "cooked_rabbit", "cooked_cod", "cooked_salmon",
+  // Raw meats
+  "beef", "porkchop", "chicken", "mutton", "rabbit", "cod", "salmon",
+  // Bread & baked goods
+  "bread", "cookie", "pumpkin_pie",
+  // Fruits & vegetables
+  "apple", "golden_apple", "enchanted_golden_apple",
+  "carrot", "golden_carrot", "melon_slice",
+  "baked_potato", "potato", "beetroot",
+  "sweet_berries", "glow_berries",
+  // Fish & seafood
+  "tropical_fish", "dried_kelp",
+  // Misc
+  "honey_bottle",
+  // Stews (non-stackable but valid)
+  "mushroom_stew", "beetroot_soup", "rabbit_stew",
+  // Chorus fruit (teleports, but still fills hunger)
+  "chorus_fruit",
+]);
+
+// ============================================================
 // VERSION AUTO-DETECTION HELPERS
 // ============================================================
 
@@ -210,130 +236,6 @@ function shouldRotateVersionForReason(reasonText) {
     t.includes("please update") ||
     t.includes("wrong version")
   );
-}
-
-// ============================================================
-// ✅ BAN DETECTION
-// Returns true if the kick reason indicates a ban.
-// Never reconnects on a ban — doing so worsens the situation.
-// ============================================================
-
-function isBanKick(reasonText) {
-  const t = (reasonText || "").toLowerCase();
-  return (
-    t.includes("banned") ||
-    t.includes("you are banned") ||
-    t.includes("permanently banned") ||
-    t.includes("tempban") ||
-    t.includes("temp ban") ||
-    t.includes("ip ban") ||
-    t.includes("ipban") ||
-    t.includes("suspended")
-  );
-}
-
-// ============================================================
-// ✅ ANTI-FINGERPRINTING — CLIENT SETTINGS
-//
-// A vanilla client sends a settings packet immediately after login
-// declaring render distance, skin layers, locale, etc.
-// Mineflayer does not send this automatically with realistic values,
-// which creates a detectable fingerprint on anti-cheat systems.
-//
-// skinParts bitmask (all 7 layers enabled = 127):
-//   0x01 Cape | 0x02 Jacket | 0x04 Left Sleeve | 0x08 Right Sleeve
-//   0x10 Left Pants | 0x20 Right Pants | 0x40 Hat
-// ============================================================
-
-const COMMON_LOCALES = ["en_US", "en_GB", "en_AU", "en_CA", "en_NZ"];
-
-function sendClientSettings(bot, minecraftUser) {
-  try {
-    // Randomise locale and render distance slightly — real players vary
-    const locale       = COMMON_LOCALES[Math.floor(Math.random() * COMMON_LOCALES.length)];
-    const viewDistance = 8 + Math.floor(Math.random() * 5); // 8–12, realistic for a casual player
-
-    bot._client.write("settings", {
-      locale,
-      viewDistance,
-      chatFlags:           0,     // Chat enabled
-      chatColors:          true,
-      skinParts:           127,   // All skin layers visible
-      mainHand:            1,     // Right hand
-      enableTextFiltering: false,
-      allowServerListings: true,
-    });
-
-    console.log(`[botmanager] 🎮 Client settings sent for ${minecraftUser} (locale: ${locale}, view: ${viewDistance})`);
-  } catch (err) {
-    // Non-fatal — older server versions may not support all fields
-    console.warn(`[botmanager] ⚠️ Could not send client settings for ${minecraftUser}:`, err.message);
-  }
-}
-
-// ============================================================
-// ✅ ANTI-FINGERPRINTING — SUBTLE LOOK DRIFT
-//
-// A bot sitting perfectly still with zero rotation changes is an
-// immediate red flag for any anti-cheat. Real AFK players still
-// have tiny involuntary mouse drift. This schedules very small
-// random yaw/pitch adjustments every 25–60 seconds.
-//
-// Adjustments are kept tiny (≤5° yaw, ≤2° pitch) so they look
-// like idle mouse drift rather than deliberate movement.
-// ============================================================
-
-const LOOK_INTERVAL_MIN_MS = 25000; // 25 seconds
-const LOOK_INTERVAL_MAX_MS = 60000; // 60 seconds
-const DEG_TO_RAD           = Math.PI / 180;
-
-function startSubtleLookDrift(bot, botId, minecraftUser) {
-  function scheduleDrift() {
-    if (!activeBots.has(botId)) return;
-
-    const delay = LOOK_INTERVAL_MIN_MS +
-      Math.random() * (LOOK_INTERVAL_MAX_MS - LOOK_INTERVAL_MIN_MS);
-
-    const timeoutId = setTimeout(() => {
-      if (!activeBots.has(botId)) return;
-      const e = activeBots.get(botId);
-      if (e.status !== "online" || !e.bot) return;
-
-      try {
-        const currentYaw   = e.bot.entity.yaw;
-        const currentPitch = e.bot.entity.pitch;
-
-        // ±5° yaw drift, ±2° pitch drift — imperceptible but present
-        const yawDelta   = (Math.random() * 10 - 5)  * DEG_TO_RAD;
-        const pitchDelta = (Math.random() * 4  - 2)  * DEG_TO_RAD;
-
-        const newYaw   = currentYaw + yawDelta;
-        const newPitch = Math.max(-1.5, Math.min(1.5, currentPitch + pitchDelta));
-
-        e.bot.look(newYaw, newPitch, false);
-      } catch (_) {
-        // Bot may be mid-reconnect — silently skip
-      }
-
-      // Schedule next drift
-      scheduleDrift();
-    }, delay);
-
-    // Store so cleanupBot can cancel it
-    if (activeBots.has(botId)) {
-      activeBots.get(botId)._lookTimeoutId = timeoutId;
-    }
-  }
-
-  // Small random delay before first drift so bots don't all drift in sync
-  const initialDelay = 5000 + Math.random() * 10000;
-  setTimeout(() => {
-    if (activeBots.has(botId) && activeBots.get(botId).status === "online") {
-      scheduleDrift();
-    }
-  }, initialDelay);
-
-  console.log(`[botmanager] 👁️ Look drift started for ${minecraftUser}`);
 }
 
 // ============================================================
@@ -407,6 +309,7 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
     user_code: userCode,
     verification_uri: verificationUri,
     expires_in: expiresIn,
+    interval,
   } = deviceCodeResponse;
 
   const effectiveExpiresIn = expiresIn || 900;
@@ -454,7 +357,7 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
         "Authentication timed out — the Microsoft device code was not redeemed in time. " +
         "Run /mcbot start again to get a new code.";
       e.status = "error";
-      setTimeout(() => cleanupBot(botId, "spawn_timeout"), 0);
+      setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
     }, 5 * 60 * 1000);
   }
 
@@ -536,20 +439,22 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     botId,
     discordId,
     minecraftUser,
-    serverHost:        host,
-    serverPort:        port,
-    version:           effectiveVersion,
-    startedAt:         new Date().toISOString(),
-    status:            "connecting",
-    spawnError:        null,
-    errorCategory:     null,
-    spawnTimeoutId:    null,
-    _lookTimeoutId:    null, // ✅ look drift timeout handle
+    serverHost: host,
+    serverPort: port,
+    version: effectiveVersion,
+    startedAt: new Date().toISOString(),
+    status: "connecting",
+    spawnError: null,
+    spawnTimeoutId: null,
     deviceCodeEmitted: false,
-    bot:               null,
+    bot: null,
   };
 
   activeBots.set(botId, entry);
+
+  // ── Hunger state — persists across reconnects for this bot session ──
+  let isEating = false;
+  let eatCooldownUntil = 0;
 
   // ── Initial spawn timeout (30s before auth code) ──────────
   entry.spawnTimeoutId = setTimeout(() => {
@@ -571,11 +476,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       bot = mineflayer.createBot({
         host,
         port,
-        username:       minecraftUser,
-        version:        versionToTry,
-        auth:           "microsoft",
+        username: minecraftUser,
+        version: versionToTry,
+        auth: "microsoft",
         profilesFolder: tokenDir,
-        onMsaCode:      (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+        onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
       });
     } catch (err) {
       console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
@@ -586,6 +491,54 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     }
 
     entry.bot = bot;
+
+    // ── Hunger / Eating behavior ────────────────────────────────
+    // mineflayer fires 'health' whenever bot.food or bot.health changes.
+    // bot.food is 0-20; 18 = 1 full bar lost (each bar = 2 points).
+    // We eat from the nearest food item in inventory, skipping dangerous foods.
+
+    /**
+     * Attempt to eat food. Returns silently if ineligible.
+     * Uses mineflayer's high-level equip + consume API which handles
+     * the right-click timing and eat animation automatically.
+     */
+    async function tryEat() {
+      if (isEating || Date.now() < eatCooldownUntil) return;
+      if (!activeBots.has(botId)) return;
+      if (bot.food >= 18) return; // Not hungry enough yet
+
+      // Find the first food item in inventory (hotbar preferred since
+      // mineflayer's inventory.items() returns hotbar slots first).
+      const foodItem = bot.inventory.items().find(
+        (item) => item && BOT_FOOD_ITEMS.has(item.name)
+      );
+      if (!foodItem) return;
+
+      isEating = true;
+      try {
+        // Equip food to main hand, then consume (right-click + wait for eat animation).
+        await bot.equip(foodItem, "hand");
+        await bot.consume();
+        eatCooldownUntil = Date.now() + 1500; // 1.5s cooldown between meals
+        console.log(
+          `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} ` +
+          `(food: ${bot.food}/20)`
+        );
+      } catch {
+        // Ignore eating errors — item may have moved or bot may be in wrong state.
+      } finally {
+        isEating = false;
+      }
+    }
+
+    // React to any food level change from the server.
+    bot.on("health", () => {
+      if (bot.food < 18) {
+        tryEat().catch(() => {});
+      }
+    });
+
+    // ── Standard bot events ─────────────────────────────────────
 
     bot.once("login", () => {
       if (!activeBots.has(botId)) return;
@@ -608,34 +561,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (typeof onLinkVerified === "function") {
         try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
       }
-
-      // ✅ ANTI-FINGERPRINTING: Send realistic client settings packet
-      // Small random delay mimics the timing of a real client
-      setTimeout(() => {
-        if (activeBots.has(botId) && activeBots.get(botId).status === "online") {
-          sendClientSettings(bot, minecraftUser);
-        }
-      }, 500 + Math.random() * 1000);
-
-      // ✅ ANTI-FINGERPRINTING: Start subtle look drift
-      startSubtleLookDrift(bot, botId, minecraftUser);
     });
 
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
-
-      // ── ✅ Ban detection — never reconnect on a ban ────────
-      if (isBanKick(reasonText)) {
-        console.error(`[botmanager] 🚫 Ban detected for ${minecraftUser} — stopping permanently`);
-        const e = activeBots.get(botId);
-        e.status = "error";
-        e.errorCategory = "banned";
-        e.spawnError = `Banned from server: ${reasonText}`;
-        cleanupBot(botId, "banned");
-        return;
-      }
 
       if (autoMode && shouldRotateVersionForReason(reasonText)) {
         autoVersionIndex++;
@@ -669,7 +600,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
 
-      const errCode    = err.code;
+      const errCode = err.code;
       const errMessage = err.message || "";
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
@@ -691,8 +622,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
         clearAuthCache(minecraftUser);
         e.status = "error";
-        e.errorCategory = "auth_error";
         e.spawnError = "Microsoft authentication failed. Run /mcbot start again to sign in.";
+        e.errorCategory = "auth_error";
         cleanupBot(botId, "auth_error");
         return;
       }
@@ -808,12 +739,6 @@ function cleanupBot(botId, reason) {
     entry.spawnTimeoutId = null;
   }
 
-  // ✅ Cancel any pending look drift timeout
-  if (entry._lookTimeoutId) {
-    clearTimeout(entry._lookTimeoutId);
-    entry._lookTimeoutId = null;
-  }
-
   activeBots.delete(botId);
 
   try { entry.bot.quit(); } catch (_) {}
@@ -837,16 +762,15 @@ function getBotStatus(discordId, minecraftUser) {
   return {
     found: true,
     bot: {
-      botId:         entry.botId,
-      discordId:     entry.discordId,
+      botId: entry.botId,
+      discordId: entry.discordId,
       minecraftUser: entry.minecraftUser,
-      serverHost:    entry.serverHost,
-      serverPort:    entry.serverPort,
-      version:       entry.version,
-      startedAt:     entry.startedAt,
-      status:        entry.status,
-      errorCategory: entry.errorCategory || null,
-      spawnError:    entry.spawnError || null,
+      serverHost: entry.serverHost,
+      serverPort: entry.serverPort,
+      version: entry.version,
+      startedAt: entry.startedAt,
+      status: entry.status,
+      spawnError: entry.spawnError || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
     },
   };
@@ -857,20 +781,19 @@ function getBotStatus(discordId, minecraftUser) {
  */
 function getBotsForUser(discordId) {
   const prefix = `${discordId}:`;
-  const bots   = [];
+  const bots = [];
   for (const [botId, entry] of activeBots.entries()) {
     if (botId.startsWith(prefix)) {
       bots.push({
-        botId:         entry.botId,
-        discordId:     entry.discordId,
+        botId: entry.botId,
+        discordId: entry.discordId,
         minecraftUser: entry.minecraftUser,
-        serverHost:    entry.serverHost,
-        serverPort:    entry.serverPort,
-        version:       entry.version,
-        startedAt:     entry.startedAt,
-        status:        entry.status,
-        errorCategory: entry.errorCategory || null,
-        spawnError:    entry.spawnError || null,
+        serverHost: entry.serverHost,
+        serverPort: entry.serverPort,
+        version: entry.version,
+        startedAt: entry.startedAt,
+        status: entry.status,
+        spawnError: entry.spawnError || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       });
     }
@@ -884,14 +807,14 @@ function getBotCount() {
 
 function listAllBots() {
   return [...activeBots.values()].map((entry) => ({
-    botId:         entry.botId,
-    discordId:     entry.discordId,
+    botId: entry.botId,
+    discordId: entry.discordId,
     minecraftUser: entry.minecraftUser,
-    serverHost:    entry.serverHost,
-    serverPort:    entry.serverPort,
-    version:       entry.version,
-    startedAt:     entry.startedAt,
-    status:        entry.status,
+    serverHost: entry.serverHost,
+    serverPort: entry.serverPort,
+    version: entry.version,
+    startedAt: entry.startedAt,
+    status: entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
   }));
 }
