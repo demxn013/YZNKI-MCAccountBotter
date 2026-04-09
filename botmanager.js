@@ -130,6 +130,38 @@ function clearAuthCache(username) {
 const activeBots = new Map();
 
 // ============================================================
+// RECENTLY ENDED BOTS — for Discord DM notifications
+// Populated when a bot ends unexpectedly (not via manual stop).
+// Cleared when GET /ended is called.
+// ============================================================
+const recentlyEndedBots = [];
+
+function recordEndedBot(entry, endReason) {
+  // Don't notify for manual stops
+  if (endReason === "manual_stop" || endReason === "stopall" || endReason === "stop_user_all") return;
+
+  recentlyEndedBots.push({
+    botId:          entry.botId,
+    discordId:      entry.discordId,
+    minecraftUser:  entry.minecraftUser,
+    serverHost:     entry.serverHost,
+    serverPort:     entry.serverPort,
+    version:        entry.version,
+    endReason,
+    spawnError:     entry.spawnError || null,
+    lastKickReason: entry.lastKickReason || null,
+    errorCategory:  entry.errorCategory || null,
+    endedAt:        new Date().toISOString(),
+  });
+}
+
+function getAndClearRecentlyEnded() {
+  const snapshot = [...recentlyEndedBots];
+  recentlyEndedBots.length = 0;
+  return snapshot;
+}
+
+// ============================================================
 // AUTH ERROR DEDUP GUARD
 // Keyed by botId so each account has its own dedup state.
 // ============================================================
@@ -139,6 +171,38 @@ const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
+
+// ============================================================
+// DONUTSMP VERIFICATION RECONNECT SETTINGS
+//
+// DonutSMP now shows a security/verification screen on new logins.
+// This causes the bot to connect at the protocol level (login fires,
+// status = online) but then get disconnected shortly after with
+// "socketClosed" before it actually joins the world.
+//
+// We auto-reconnect a limited number of times for this specific case
+// before giving up and reporting an error to the user.
+// ============================================================
+const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
+const DONUTSMP_MAX_VERIFICATION_RETRIES = 5;
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 8000; // 8 seconds
+
+function isDonutSmpHost(host) {
+  if (!host) return false;
+  const lower = host.toLowerCase();
+  return DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
+}
+
+/**
+ * Detect if a disconnect reason looks like the DonutSMP verification screen
+ * disconnect — typically "socketClosed" shortly after login.
+ */
+function isDonutSmpVerificationDisconnect(reason, secondsOnline) {
+  if (!reason) return false;
+  const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
+  // socketClosed within the first 30 seconds of being "online" is the telltale sign
+  return r.includes("socketclosed") && secondsOnline < 30;
+}
 
 // ============================================================
 // VERSION CACHE
@@ -435,6 +499,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const tokenDir = ensureAccountDir(minecraftUser);
 
+  // Track whether this is a DonutSMP server for special reconnect handling
+  const isDonutSmp = isDonutSmpHost(hostLower);
+
   const entry = {
     botId,
     discordId,
@@ -448,6 +515,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     spawnTimeoutId: null,
     deviceCodeEmitted: false,
     bot: null,
+    // DonutSMP verification retry tracking
+    isDonutSmp,
+    donutSmpVerificationRetries: 0,
+    connectedSince: null, // track when we went "online" for elapsed time checks
   };
 
   activeBots.set(botId, entry);
@@ -470,6 +541,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   function spawnBot(versionToTry) {
     entry.version = versionToTry;
+    // Reset connected timestamp on each spawn attempt
+    entry.connectedSince = null;
 
     let bot;
     try {
@@ -493,22 +566,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.bot = bot;
 
     // ── Hunger / Eating behavior ────────────────────────────────
-    // mineflayer fires 'health' whenever bot.food or bot.health changes.
-    // bot.food is 0-20; 18 = 1 full bar lost (each bar = 2 points).
-    // We eat from the nearest food item in inventory, skipping dangerous foods.
 
-    /**
-     * Attempt to eat food. Returns silently if ineligible.
-     * Uses mineflayer's high-level equip + consume API which handles
-     * the right-click timing and eat animation automatically.
-     */
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
-      if (bot.food >= 18) return; // Not hungry enough yet
+      if (bot.food >= 18) return;
 
-      // Find the first food item in inventory (hotbar preferred since
-      // mineflayer's inventory.items() returns hotbar slots first).
       const foodItem = bot.inventory.items().find(
         (item) => item && BOT_FOOD_ITEMS.has(item.name)
       );
@@ -516,22 +579,20 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       isEating = true;
       try {
-        // Equip food to main hand, then consume (right-click + wait for eat animation).
         await bot.equip(foodItem, "hand");
         await bot.consume();
-        eatCooldownUntil = Date.now() + 1500; // 1.5s cooldown between meals
+        eatCooldownUntil = Date.now() + 1500;
         console.log(
           `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} ` +
           `(food: ${bot.food}/20)`
         );
       } catch {
-        // Ignore eating errors — item may have moved or bot may be in wrong state.
+        // Ignore eating errors
       } finally {
         isEating = false;
       }
     }
 
-    // React to any food level change from the server.
     bot.on("health", () => {
       if (bot.food < 18) {
         tryEat().catch(() => {});
@@ -550,6 +611,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
       e.status = "online";
       e.version = versionToTry;
+      e.connectedSince = Date.now(); // record when we went online
 
       if (autoMode) {
         versionCache.set(hostLower, versionToTry);
@@ -557,6 +619,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
 
       saveToken(minecraftUser);
+
+      if (isDonutSmp) {
+        console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect`);
+      }
 
       if (typeof onLinkVerified === "function") {
         try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
@@ -655,7 +721,51 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
       if (e.status === "online" || e.status === "connecting") {
+        const reasonStr = String(reason || "").toLowerCase();
         console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
+
+        // ── DonutSMP verification screen handling ────────────
+        // If the bot was "online" for only a few seconds and got a
+        // socketClosed, it's almost certainly the verification screen.
+        // Auto-reconnect silently up to DONUTSMP_MAX_VERIFICATION_RETRIES times.
+        if (
+          e.isDonutSmp &&
+          reasonStr.includes("socketclosed") &&
+          e.connectedSince !== null &&
+          isDonutSmpVerificationDisconnect(reason, Math.floor((Date.now() - e.connectedSince) / 1000))
+        ) {
+          if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
+            e.donutSmpVerificationRetries++;
+            console.log(
+              `[botmanager] 🟠 DonutSMP verification disconnect detected for ${minecraftUser} ` +
+              `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
+            );
+            e.status = "reconnecting";
+            e.spawnError = null; // clear any stale error
+            setTimeout(() => {
+              if (!activeBots.has(botId)) return;
+              try { bot.end(); } catch (_) {}
+              spawnBot(e.version);
+            }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
+            return;
+          } else {
+            // Exhausted retries — give up and report a helpful error
+            console.warn(
+              `[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — ` +
+              `reporting error to user`
+            );
+            e.status = "error";
+            e.spawnError =
+              "DonutSMP is requiring account verification before allowing you to join. " +
+              "Please log into DonutSMP manually once to complete the verification process, " +
+              "then try /mcbot start again.";
+            e.errorCategory = "donutsmp_verification";
+            cleanupBot(botId, "donutsmp_verification_failed");
+            return;
+          }
+        }
+
+        // ── Standard disconnect handling ─────────────────────
         e.status = "error";
         e.spawnError = `Disconnected: ${reason}`;
 
@@ -741,6 +851,9 @@ function cleanupBot(botId, reason) {
 
   activeBots.delete(botId);
 
+  // Record for the /ended endpoint (Discord bot polls this for offline DMs)
+  recordEndedBot(entry, reason);
+
   try { entry.bot.quit(); } catch (_) {}
   try { entry.bot.end(); } catch (_) {}
 
@@ -771,7 +884,10 @@ function getBotStatus(discordId, minecraftUser) {
       startedAt: entry.startedAt,
       status: entry.status,
       spawnError: entry.spawnError || null,
+      errorCategory: entry.errorCategory || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+      // DonutSMP-specific info for debugging
+      donutSmpVerificationRetries: entry.isDonutSmp ? entry.donutSmpVerificationRetries : undefined,
     },
   };
 }
@@ -794,6 +910,7 @@ function getBotsForUser(discordId) {
         startedAt: entry.startedAt,
         status: entry.status,
         spawnError: entry.spawnError || null,
+        errorCategory: entry.errorCategory || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       });
     }
@@ -829,4 +946,5 @@ module.exports = {
   getBotsForUser,
   listAllBots,
   getBotCount,
+  getAndClearRecentlyEnded,
 };
