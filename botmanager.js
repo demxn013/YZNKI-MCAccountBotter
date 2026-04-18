@@ -169,7 +169,7 @@ const handledAuthErrors = new Set();
 const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
-const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
+const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "10000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
