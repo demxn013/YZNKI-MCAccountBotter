@@ -175,17 +175,21 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 // ============================================================
 // DONUTSMP VERIFICATION RECONNECT SETTINGS
 //
-// DonutSMP now shows a security/verification screen on new logins.
-// This causes the bot to connect at the protocol level (login fires,
-// status = online) but then get disconnected shortly after with
-// "socketClosed" before it actually joins the world.
+// DonutSMP disconnects bots with "socketClosed" both BEFORE login
+// (connection-phase rejection) and shortly AFTER login (verification
+// screen). We now handle both cases with the same retry counter.
 //
-// We auto-reconnect a limited number of times for this specific case
-// before giving up and reporting an error to the user.
+// Pre-login socketClosed: bot never fires `login`, connectedSince = null.
+// Post-login socketClosed: bot fired `login`, connectedSince is set,
+//   and secondsOnline < 30.
+//
+// Both cases are treated as verification-related and retried silently.
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
-const DONUTSMP_MAX_VERIFICATION_RETRIES = 5;
-const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 8000; // 8 seconds
+// How many total socketClosed retries before giving up (pre + post login combined)
+const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
+// Delay between retries — give DonutSMP time to process the verification state
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 10000; // 10 seconds
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -195,13 +199,20 @@ function isDonutSmpHost(host) {
 
 /**
  * Detect if a disconnect reason looks like the DonutSMP verification screen
- * disconnect — typically "socketClosed" shortly after login.
+ * disconnect. Now handles both pre-login (connectedSince === null) and
+ * post-login (connectedSince set, secondsOnline < 30) cases.
  */
-function isDonutSmpVerificationDisconnect(reason, secondsOnline) {
+function isDonutSmpVerificationDisconnect(reason, connectedSince) {
   if (!reason) return false;
   const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
-  // socketClosed within the first 30 seconds of being "online" is the telltale sign
-  return r.includes("socketclosed") && secondsOnline < 30;
+  if (!r.includes("socketclosed")) return false;
+
+  // Pre-login: connectedSince is null — bot never made it past the handshake
+  if (connectedSince === null) return true;
+
+  // Post-login: bot was online for less than 30 seconds
+  const secondsOnline = Math.floor((Date.now() - connectedSince) / 1000);
+  return secondsOnline < 30;
 }
 
 // ============================================================
@@ -516,9 +527,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     deviceCodeEmitted: false,
     bot: null,
     // DonutSMP verification retry tracking
+    // Counts ALL socketClosed retries regardless of whether login fired
     isDonutSmp,
     donutSmpVerificationRetries: 0,
-    connectedSince: null, // track when we went "online" for elapsed time checks
+    connectedSince: null, // set when login fires; null = pre-login
   };
 
   activeBots.set(botId, entry);
@@ -527,17 +539,26 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // ── Initial spawn timeout (30s before auth code) ──────────
+  // ── Initial spawn timeout ──────────────────────────────────
+  // For DonutSMP we give much more time because the verification
+  // retry loop can take several minutes before the bot gets through.
+  const initialSpawnTimeoutMs = isDonutSmp
+    ? (DONUTSMP_MAX_VERIFICATION_RETRIES * (DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS + 5000)) + 30000
+    : 30000;
+
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
     const e = activeBots.get(botId);
     if (e.status !== "connecting") return;
     if (e.deviceCodeEmitted) return; // auth timeout handled separately
-    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 30s — cleaning up`);
-    e.spawnError = "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
+    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s — cleaning up`);
+    e.spawnError = isDonutSmp
+      ? "DonutSMP is requiring account verification before allowing you to join. Please log into DonutSMP manually once to complete the verification process, then try /mcbot start again."
+      : "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
     e.status = "error";
+    if (isDonutSmp) e.errorCategory = "donutsmp_verification";
     setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
-  }, 30000);
+  }, initialSpawnTimeoutMs);
 
   function spawnBot(versionToTry) {
     entry.version = versionToTry;
@@ -605,10 +626,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       console.log(`[botmanager] ✅ Bot logged in: ${minecraftUser} on ${host}:${port} (${versionToTry})`);
       const e = activeBots.get(botId);
-      if (e.spawnTimeoutId) {
+
+      // Only clear the spawn timeout on first successful login —
+      // not during DonutSMP verification retries (we want the outer
+      // timeout to remain as the final safety net).
+      if (!isDonutSmp && e.spawnTimeoutId) {
         clearTimeout(e.spawnTimeoutId);
         e.spawnTimeoutId = null;
       }
+
       e.status = "online";
       e.version = versionToTry;
       e.connectedSince = Date.now(); // record when we went online
@@ -621,7 +647,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect`);
+        console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       }
 
       if (typeof onLinkVerified === "function") {
@@ -720,64 +746,61 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.on("end", (reason) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
-      if (e.status === "online" || e.status === "connecting") {
-        const reasonStr = String(reason || "").toLowerCase();
-        console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
-        // ── DonutSMP verification screen handling ────────────
-        // If the bot was "online" for only a few seconds and got a
-        // socketClosed, it's almost certainly the verification screen.
-        // Auto-reconnect silently up to DONUTSMP_MAX_VERIFICATION_RETRIES times.
-        if (
-          e.isDonutSmp &&
-          reasonStr.includes("socketclosed") &&
-          e.connectedSince !== null &&
-          isDonutSmpVerificationDisconnect(reason, Math.floor((Date.now() - e.connectedSince) / 1000))
-        ) {
-          if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
-            e.donutSmpVerificationRetries++;
-            console.log(
-              `[botmanager] 🟠 DonutSMP verification disconnect detected for ${minecraftUser} ` +
-              `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
-            );
-            e.status = "reconnecting";
-            e.spawnError = null; // clear any stale error
-            setTimeout(() => {
-              if (!activeBots.has(botId)) return;
-              try { bot.end(); } catch (_) {}
-              spawnBot(e.version);
-            }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
-            return;
-          } else {
-            // Exhausted retries — give up and report a helpful error
-            console.warn(
-              `[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — ` +
-              `reporting error to user`
-            );
-            e.status = "error";
-            e.spawnError =
-              "DonutSMP is requiring account verification before allowing you to join. " +
-              "Please log into DonutSMP manually once to complete the verification process, " +
-              "then try /mcbot start again.";
-            e.errorCategory = "donutsmp_verification";
-            cleanupBot(botId, "donutsmp_verification_failed");
-            return;
-          }
-        }
+      // Only act on end events when we're in an active state.
+      // "reconnecting" means a retry is already scheduled — ignore.
+      if (e.status !== "online" && e.status !== "connecting") return;
 
-        // ── Standard disconnect handling ─────────────────────
-        e.status = "error";
-        e.spawnError = `Disconnected: ${reason}`;
+      const reasonStr = String(reason || "").toLowerCase();
+      console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
-        if (AUTO_RECONNECT) {
+      // ── DonutSMP verification screen handling ──────────────
+      // Handles BOTH pre-login (connectedSince === null) and post-login
+      // (connectedSince set, online < 30s) socketClosed disconnects.
+      if (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) {
+        if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
+          e.donutSmpVerificationRetries++;
+          const phase = e.connectedSince === null ? "pre-login" : "post-login";
+          console.log(
+            `[botmanager] 🟠 DonutSMP verification disconnect (${phase}) for ${minecraftUser} ` +
+            `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
+          );
           e.status = "reconnecting";
+          e.spawnError = null; // clear any stale error
           setTimeout(() => {
             if (!activeBots.has(botId)) return;
+            try { bot.end(); } catch (_) {}
             spawnBot(e.version);
-          }, RECONNECT_DELAY_MS);
+          }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
+          return;
         } else {
-          cleanupBot(botId, "end");
+          // Exhausted retries — give up and report a helpful error
+          console.warn(
+            `[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — reporting error to user`
+          );
+          e.status = "error";
+          e.spawnError =
+            "DonutSMP is requiring account verification before allowing you to join. " +
+            "Please log into DonutSMP manually once to complete the verification process, " +
+            "then try /mcbot start again.";
+          e.errorCategory = "donutsmp_verification";
+          cleanupBot(botId, "donutsmp_verification_failed");
+          return;
         }
+      }
+
+      // ── Standard disconnect handling ─────────────────────
+      e.status = "error";
+      e.spawnError = `Disconnected: ${reason}`;
+
+      if (AUTO_RECONNECT) {
+        e.status = "reconnecting";
+        setTimeout(() => {
+          if (!activeBots.has(botId)) return;
+          spawnBot(e.version);
+        }, RECONNECT_DELAY_MS);
+      } else {
+        cleanupBot(botId, "end");
       }
     });
   }
