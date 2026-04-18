@@ -188,8 +188,8 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 // How many total socketClosed retries before giving up (pre + post login combined)
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
-// Delay between retries — give DonutSMP time to process the verification state
-const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 10000; // 10 seconds
+// Delay between retries — 5 seconds as requested
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000; // 5 seconds
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -202,6 +202,21 @@ function isDonutSmpHost(host) {
  * disconnect. Now handles both pre-login (connectedSince === null) and
  * post-login (connectedSince set, secondsOnline < 30) cases.
  */
+/**
+ * Detect DonutSMP's "unauthorized login" security kick.
+ * This fires when they want the user to confirm via Discord DM.
+ */
+function isDonutSmpVerificationKick(reasonText) {
+  if (!reasonText) return false;
+  const t = reasonText.toLowerCase();
+  return (
+    t.includes("unauthorized login") ||
+    t.includes("blocked it") ||
+    t.includes("confirm it via the button") ||
+    t.includes("possible unauthorized")
+  );
+}
+
 function isDonutSmpVerificationDisconnect(reason, connectedSince) {
   if (!reason) return false;
   const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
@@ -543,7 +558,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   // For DonutSMP we give much more time because the verification
   // retry loop can take several minutes before the bot gets through.
   const initialSpawnTimeoutMs = isDonutSmp
-    ? (DONUTSMP_MAX_VERIFICATION_RETRIES * (DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS + 5000)) + 30000
+    ? (DONUTSMP_MAX_VERIFICATION_RETRIES * (DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS + 8000)) + 30000
     : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
@@ -660,6 +675,48 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
 
+      const e = activeBots.get(botId);
+
+      // ── If a DonutSMP verification retry is already scheduled (status =
+      //    "reconnecting"), the end handler already handled this disconnect.
+      //    Ignore the kicked event entirely — don't touch status or cleanup.
+      if (e.status === "reconnecting") {
+        console.log(`[botmanager] 🟠 Ignoring kicked event for ${minecraftUser} — DonutSMP retry already scheduled`);
+        return;
+      }
+
+      // ── DonutSMP verification kick — the kicked message itself tells us
+      //    this is the "unauthorized login" security screen. Treat it the
+      //    same as the socketClosed verification disconnect and retry.
+      if (e.isDonutSmp && isDonutSmpVerificationKick(reasonText)) {
+        if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
+          e.donutSmpVerificationRetries++;
+          console.log(
+            `[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} ` +
+            `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
+          );
+          e.status = "reconnecting";
+          e.spawnError = null;
+          setTimeout(() => {
+            if (!activeBots.has(botId)) return;
+            try { bot.end(); } catch (_) {}
+            spawnBot(e.version);
+          }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
+          return;
+        } else {
+          console.warn(`[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} (kicked)`);
+          e.status = "error";
+          e.spawnError =
+            "DonutSMP is requiring account verification before allowing you to join. " +
+            "Please log into DonutSMP manually once to complete the verification process, " +
+            "then try /mcbot start again.";
+          e.errorCategory = "donutsmp_verification";
+          cleanupBot(botId, "donutsmp_verification_failed");
+          return;
+        }
+      }
+
+      // ── Auto-version rotation on version mismatch kicks ───────
       if (autoMode && shouldRotateVersionForReason(reasonText)) {
         autoVersionIndex++;
         if (autoVersionIndex < autoCandidates.length) {
@@ -671,7 +728,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         }
       }
 
-      const e = activeBots.get(botId);
       e.status = "error";
       e.spawnError = `Kicked: ${reasonText}`;
 
