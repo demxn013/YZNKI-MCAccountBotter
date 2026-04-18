@@ -607,6 +607,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     }
 
     entry.bot = bot;
+    let kickHandled = false; // set true when kicked handler schedules a retry, prevents end from double-scheduling
 
     // ── Hunger / Eating behavior ────────────────────────────────
 
@@ -684,11 +685,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       const e = activeBots.get(botId);
 
-      // ── If a DonutSMP verification retry is already scheduled (status =
-      //    "reconnecting"), the end handler already handled this disconnect.
-      //    Ignore the kicked event entirely — don't touch status or cleanup.
-      if (e.status === "reconnecting") {
-        console.log(`[botmanager] 🟠 Ignoring kicked event for ${minecraftUser} — DonutSMP retry already scheduled`);
+      // ── Guard: only process kicked events from the CURRENT bot instance.
+      if (entry.bot !== bot) return;
+
+      // ── If non-DonutSMP and a retry is already scheduled, ignore.
+      if (e.status === "reconnecting" && !e.isDonutSmp) {
+        console.log(`[botmanager] 🟠 Ignoring kicked event for ${minecraftUser} — retry already scheduled`);
         return;
       }
 
@@ -704,6 +706,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           );
           e.status = "reconnecting";
           e.spawnError = null;
+          kickHandled = true;
           setTimeout(() => {
             if (!activeBots.has(botId)) return;
             try { bot.end(); } catch (_) {}
@@ -810,9 +813,16 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
 
-      // Only act on end events when we're in an active state.
-      // "reconnecting" means a retry is already scheduled — ignore.
-      if (e.status !== "online" && e.status !== "connecting") return;
+      // Guard: only process end events from the CURRENT bot instance.
+      // On retries, a new bot is created and assigned to entry.bot.
+      // Stale end events from old instances must be ignored.
+      if (entry.bot !== bot) return;
+
+      // Allow "reconnecting" through for DonutSMP — each retry spawns a new
+      // mineflayer instance whose end event must be processed to drive the next retry.
+      // For non-DonutSMP, "reconnecting" means a retry is already scheduled — ignore.
+      if (e.status !== "online" && e.status !== "connecting" && e.status !== "reconnecting") return;
+      if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
       const reasonStr = String(reason || "").toLowerCase();
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
@@ -820,6 +830,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       // ── DonutSMP verification screen handling ──────────────
       // Handles BOTH pre-login (connectedSince === null) and post-login
       // (connectedSince set, online < 30s) socketClosed disconnects.
+      // Skip if the kicked handler already scheduled a retry for this same bot instance.
+      if (kickHandled) {
+        kickHandled = false;
+        return;
+      }
       if (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) {
         if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
           e.donutSmpVerificationRetries++;
