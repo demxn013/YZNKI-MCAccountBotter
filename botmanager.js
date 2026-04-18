@@ -169,7 +169,7 @@ const handledAuthErrors = new Set();
 const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
-const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "10000", 10);
+const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
@@ -555,30 +555,37 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let eatCooldownUntil = 0;
 
   // ── Initial spawn timeout ──────────────────────────────────
-  // For DonutSMP we give much more time because the verification
-  // retry loop can take several minutes before the bot gets through.
-  const initialSpawnTimeoutMs = isDonutSmp
-    ? (DONUTSMP_MAX_VERIFICATION_RETRIES * (DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS + 8000)) + 30000
-    : 30000;
+  // For DonutSMP: 90s gives all 10 retries (5s delay + ~4s connect window each)
+  // room to complete. If verification isn't done by then, we give up and tell the user.
+  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
     const e = activeBots.get(botId);
-    if (e.status !== "connecting") return;
+    // Fire on both "connecting" and "reconnecting" — "reconnecting" means a
+    // DonutSMP retry loop is in progress; we must terminate it after the deadline.
+    if (e.status !== "connecting" && e.status !== "reconnecting") return;
     if (e.deviceCodeEmitted) return; // auth timeout handled separately
-    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s — cleaning up`);
+    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s (${e.donutSmpVerificationRetries} retries attempted) — giving up`);
     e.spawnError = isDonutSmp
-      ? "DonutSMP is requiring account verification before allowing you to join. Please log into DonutSMP manually once to complete the verification process, then try /mcbot start again."
+      ? "DonutSMP security check timed out — the verification was not completed in time. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
       : "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
     e.status = "error";
     if (isDonutSmp) e.errorCategory = "donutsmp_verification";
-    setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
+    cleanupBot(botId, "spawn_timeout");
   }, initialSpawnTimeoutMs);
 
   function spawnBot(versionToTry) {
     entry.version = versionToTry;
     // Reset connected timestamp on each spawn attempt
     entry.connectedSince = null;
+
+    if (entry.donutSmpVerificationRetries > 0) {
+      console.log(
+        `[botmanager] 🟠 DonutSMP retry attempt ${entry.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES} ` +
+        `for ${minecraftUser} — connecting to ${host}:${port}...`
+      );
+    }
 
     let bot;
     try {
