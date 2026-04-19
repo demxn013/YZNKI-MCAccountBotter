@@ -189,7 +189,7 @@ const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 // How many total socketClosed retries before giving up (pre + post login combined)
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 // Delay between retries — 5 seconds as requested
-const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000; // 5 seconds
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 10000; // 5 seconds
 
 function isDonutSmpHost(host) {
   if (!host) return false;
