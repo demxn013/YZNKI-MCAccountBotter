@@ -416,7 +416,8 @@ function makeBotId(discordId, minecraftUser) {
 // login handshake — do NOT send custom_payload/brand here or Paper
 // will see a duplicate and kick with "Invalid sequence".
 // ============================================================
-function sendClientSettings(bot) {
+function sendClientSettings(bot, username, context) {
+  console.log(`[botmanager] 📋 [${username}] Attempting to send client settings (context: ${context})`);
   try {
     bot._client.write("settings", {
       locale: "en_US",
@@ -428,9 +429,9 @@ function sendClientSettings(bot) {
       enableTextFiltering: false,
       enableServerListing: true,
     });
-    console.log(`[botmanager] 📋 Sent client settings for ${bot.username}`);
+    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully (context: ${context})`);
   } catch (err) {
-    console.warn(`[botmanager] ⚠️ Could not send client settings for ${bot.username}:`, err.message);
+    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings (context: ${context}):`, err.message);
   }
 }
 
@@ -557,6 +558,41 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.bot = bot;
     let kickHandled = false;
 
+    // ── Packet sniffer — log ALL outgoing packets during the quiet window ────
+    // This intercepts bot._client.write to log every packet the bot sends,
+    // so we can pinpoint exactly what triggers "Invalid sequence" on DonutSMP.
+    if (isDonutSmp) {
+      const originalWrite = bot._client.write.bind(bot._client);
+      bot._client.write = function packetWriteProxy(name, params) {
+        const e = activeBots.get(botId);
+        const nowMs = Date.now();
+        const quietUntil = e ? e.donutSmpQuietUntil : 0;
+        const isInQuietWindow = nowMs < quietUntil;
+        const msRemaining = quietUntil > 0 ? Math.max(0, quietUntil - nowMs) : 0;
+
+        if (isInQuietWindow) {
+          // Log every packet sent during the quiet window — these are suspects.
+          console.warn(
+            `[botmanager] ⚠️ [${minecraftUser}] PACKET SENT DURING QUIET WINDOW (+${Math.round((DONUTSMP_POST_LOGIN_QUIET_MS - msRemaining) / 1000)}s in, ${Math.round(msRemaining / 1000)}s remaining): ` +
+            `${name} — ${JSON.stringify(params)}`
+          );
+        } else {
+          // After quiet window: log packets for a further 10s so we can see
+          // what gets sent immediately after physics re-enable + settings.
+          const msAfterQuiet = quietUntil > 0 ? nowMs - quietUntil : -1;
+          if (msAfterQuiet >= 0 && msAfterQuiet < 10000) {
+            console.log(
+              `[botmanager] 📡 [${minecraftUser}] POST-QUIET PACKET (+${Math.round(msAfterQuiet / 1000)}s after quiet end): ` +
+              `${name} — ${JSON.stringify(params)}`
+            );
+          }
+        }
+
+        return originalWrite(name, params);
+      };
+      console.log(`[botmanager] 🔍 [${minecraftUser}] Packet sniffer installed on bot._client.write`);
+    }
+
     // ── Hunger ───────────────────────────────────────────────────────────────
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
@@ -626,6 +662,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
         if (bot.physicsEnabled !== undefined) {
           bot.physicsEnabled = false;
+          console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled (physicsEnabled=false)`);
+        } else {
+          console.warn(`[botmanager] ⚠️ [${minecraftUser}] bot.physicsEnabled is undefined — physics cannot be disabled! Mineflayer may still send position packets.`);
         }
 
         console.log(
@@ -637,14 +676,23 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return;
 
+          console.log(`[botmanager] 🟠 [${minecraftUser}] Quiet period timer fired — re-enabling physics and sending settings`);
+
           if (bot.physicsEnabled !== undefined) {
             bot.physicsEnabled = true;
+            console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled (physicsEnabled=true)`);
           }
-          console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
 
-          // Resend client settings now that the server is fully ready.
-          // This is safe because Paper processes it idempotently.
-          sendClientSettings(bot);
+          // Small delay between physics re-enable and settings packet to avoid
+          // a burst of position + settings packets hitting the server together.
+          setTimeout(() => {
+            if (!activeBots.has(botId)) return;
+            if (entry.bot !== bot) return;
+            console.log(`[botmanager] 🟠 [${minecraftUser}] Sending client settings after post-quiet delay`);
+            sendClientSettings(bot, minecraftUser, "donutsmp-post-quiet");
+          }, 500);
+
+          console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
 
         }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
@@ -656,7 +704,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         setTimeout(() => {
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return;
-          sendClientSettings(bot);
+          sendClientSettings(bot, minecraftUser, "non-donutsmp-post-login");
         }, 1000);
       }
 
@@ -669,7 +717,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
       if (isDonutSmp) {
-        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet period active, holding all actions`);
+        const e = activeBots.get(botId);
+        const msIntoQuiet = e ? Math.round((Date.now() - (e.donutSmpQuietUntil - DONUTSMP_POST_LOGIN_QUIET_MS)) / 1000) : "?";
+        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} at +${msIntoQuiet}s into quiet period — holding all actions`);
       }
     });
 
@@ -677,9 +727,29 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
-      console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
-
       const e = activeBots.get(botId);
+      const nowMs = Date.now();
+      const quietUntil = e ? e.donutSmpQuietUntil : 0;
+      const msAfterQuiet = quietUntil > 0 ? nowMs - quietUntil : -1;
+      const msIntoQuiet = quietUntil > 0 ? nowMs - (quietUntil - DONUTSMP_POST_LOGIN_QUIET_MS) : -1;
+      const duringQuiet = quietUntil > 0 && nowMs < quietUntil;
+
+      if (isDonutSmp) {
+        if (duringQuiet) {
+          console.warn(
+            `[botmanager] 🦵 [${minecraftUser}] Kicked DURING quiet window ` +
+            `(+${Math.round(msIntoQuiet / 1000)}s in, ${Math.round((quietUntil - nowMs) / 1000)}s before end): ${reasonText}`
+          );
+        } else if (msAfterQuiet >= 0 && msAfterQuiet < 15000) {
+          console.warn(
+            `[botmanager] 🦵 [${minecraftUser}] Kicked ${Math.round(msAfterQuiet / 1000)}s AFTER quiet window ended: ${reasonText}`
+          );
+        } else {
+          console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
+        }
+      } else {
+        console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
+      }
 
       if (entry.bot !== bot) return;
 
