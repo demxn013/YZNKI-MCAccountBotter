@@ -43,15 +43,10 @@ function ensureAccountDir(username) {
   return dir;
 }
 
-/**
- * Check whether valid Microsoft auth cache exists for this account.
- * Checks the account's own isolated directory only.
- */
 function loadToken(username) {
   const dir = accountTokenDir(username);
   if (!fs.existsSync(dir)) return undefined;
 
-  // 1. Check our own marker file
   try {
     const mp = markerPath(username);
     if (fs.existsSync(mp)) {
@@ -64,8 +59,6 @@ function loadToken(username) {
     // fall through
   }
 
-  // 2. Check for prismarine-auth hash-prefixed cache files.
-  //    Safe to trust here because the directory is account-specific.
   try {
     const files = fs.readdirSync(dir);
     const prismarinePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
@@ -90,10 +83,6 @@ function saveToken(username) {
   }
 }
 
-/**
- * Clear ALL Microsoft auth state for a specific account.
- * Only touches that account's own subdirectory.
- */
 function clearAuthCache(username) {
   const dir = accountTokenDir(username);
   if (!fs.existsSync(dir)) {
@@ -123,21 +112,15 @@ function clearAuthCache(username) {
 
 // ============================================================
 // IN-MEMORY BOT REGISTRY
-//
-// Key: botId = `${discordId}:${minecraftUser.toLowerCase()}`
-// This allows multiple bots per Discord user (one per MC account).
 // ============================================================
 const activeBots = new Map();
 
 // ============================================================
-// RECENTLY ENDED BOTS — for Discord DM notifications
-// Populated when a bot ends unexpectedly (not via manual stop).
-// Cleared when GET /ended is called.
+// RECENTLY ENDED BOTS
 // ============================================================
 const recentlyEndedBots = [];
 
 function recordEndedBot(entry, endReason) {
-  // Don't notify for manual stops
   if (endReason === "manual_stop" || endReason === "stopall" || endReason === "stop_user_all") return;
 
   recentlyEndedBots.push({
@@ -163,14 +146,13 @@ function getAndClearRecentlyEnded() {
 
 // ============================================================
 // AUTH ERROR DEDUP GUARD
-// Keyed by botId so each account has its own dedup state.
 // ============================================================
 const handledAuthErrors = new Set();
-const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000;
 
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
-const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
+const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 
 // ============================================================
 // DONUTSMP SETTINGS
@@ -179,18 +161,10 @@ const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
-// "Invalid sequence" fix — post Jan 2 2026 DonutSMP update:
-// Suppress ALL outgoing packets (movement, eating, etc.) for this
-// many milliseconds after login fires. DonutSMP kicks bots that send
-// any packets during the initial world/chunk loading burst.
-// 10 seconds is sufficient in practice; the article recommends
-// skipping ~2000 game ticks (100s) but wall-clock testing shows
-// 10s covers the window reliably.
-const DONUTSMP_POST_LOGIN_QUIET_MS = 10000;
-
-// Delay (ms) after the quiet period before we send client settings +
-// brand. Gives the server a moment to settle after the quiet window.
-const DONUTSMP_SETTINGS_DELAY_MS = 500;
+// How long to suppress ALL outgoing packets after login.
+// DonutSMP Paper 1.21.11 kicks bots that send packets during the
+// initial chunk-load burst with "Invalid sequence".
+const DONUTSMP_POST_LOGIN_QUIET_MS = 12000;
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -213,9 +187,7 @@ function isDonutSmpVerificationDisconnect(reason, connectedSince) {
   if (!reason) return false;
   const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
   if (!r.includes("socketclosed")) return false;
-
   if (connectedSince === null) return true;
-
   const secondsOnline = Math.floor((Date.now() - connectedSince) / 1000);
   return secondsOnline < 30;
 }
@@ -286,10 +258,6 @@ const BOT_FOOD_ITEMS = new Set([
 
 // ============================================================
 // VERSION AUTO-DETECTION HELPERS
-//
-// 1.21.11 is first — required by DonutSMP since Jan 2026 update.
-// Servers that don't support it will rotate past it via the
-// version-mismatch kick handler.
 // ============================================================
 function getAutoCandidatesForHost(hostLower) {
   return [
@@ -314,7 +282,6 @@ function shouldRotateVersionForReason(reasonText) {
 // ============================================================
 // SERVER ADDRESS PARSER
 // ============================================================
-
 function parseServerAddress(serverAddress) {
   const str = String(serverAddress || "").trim();
   const lastColon = str.lastIndexOf(":");
@@ -331,7 +298,6 @@ function parseServerAddress(serverAddress) {
 // ============================================================
 // FATAL ERROR DETECTION
 // ============================================================
-
 function isFatalNetworkError(errCode, errMessage) {
   const FATAL_CODES = new Set([
     "ENOTFOUND", "EAI_AGAIN", "EAI_NONAME",
@@ -369,7 +335,6 @@ function getFatalErrorMessage(errCode, errMessage) {
 // ============================================================
 // DEVICE CODE HANDLER
 // ============================================================
-
 function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId) {
   const {
     user_code: userCode,
@@ -439,7 +404,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
 // ============================================================
 // BOT ID HELPER
 // ============================================================
-
 function makeBotId(discordId, minecraftUser) {
   return `${discordId}:${minecraftUser.toLowerCase()}`;
 }
@@ -447,55 +411,32 @@ function makeBotId(discordId, minecraftUser) {
 // ============================================================
 // CLIENT SETTINGS SENDER
 //
-// Sends the vanilla client settings packet that servers expect after
-// login. Missing or delayed client settings is a common cause of
-// "Invalid sequence" kicks on Paper/anti-cheat servers.
-//
-// Also sends the minecraft:brand plugin channel so the server sees
-// us as a vanilla client rather than a headless bot.
+// Sends ONLY the "settings" packet (view distance, skin parts, etc.).
+// mineflayer already sends minecraft:brand automatically during the
+// login handshake — do NOT send custom_payload/brand here or Paper
+// will see a duplicate and kick with "Invalid sequence".
 // ============================================================
-function sendClientSettings(bot, version) {
+function sendClientSettings(bot) {
   try {
-    // The packet name and field names vary slightly by version but
-    // mineflayer's internal _client exposes the version-aware writer.
     bot._client.write("settings", {
       locale: "en_US",
       viewDistance: 8,
-      chatFlags: 0,        // enabled
+      chatFlags: 0,
       chatColors: true,
-      skinParts: 127,      // all skin layers visible
-      mainHand: 1,         // right hand
+      skinParts: 127,
+      mainHand: 1,
       enableTextFiltering: false,
       enableServerListing: true,
     });
     console.log(`[botmanager] 📋 Sent client settings for ${bot.username}`);
   } catch (err) {
-    // Non-fatal — older versions may not support all fields.
     console.warn(`[botmanager] ⚠️ Could not send client settings for ${bot.username}:`, err.message);
-  }
-
-  try {
-    // Send minecraft:brand plugin channel — tells the server we are a
-    // vanilla client. Servers like DonutSMP expect this shortly after login.
-    // The payload is a length-prefixed UTF-8 string "vanilla".
-    const brand = "vanilla";
-    const brandBuf = Buffer.alloc(1 + brand.length);
-    brandBuf.writeUInt8(brand.length, 0);
-    brandBuf.write(brand, 1, "utf8");
-    bot._client.write("custom_payload", {
-      channel: "minecraft:brand",
-      data: brandBuf,
-    });
-    console.log(`[botmanager] 📦 Sent minecraft:brand for ${bot.username}`);
-  } catch (err) {
-    console.warn(`[botmanager] ⚠️ Could not send brand for ${bot.username}:`, err.message);
   }
 }
 
 // ============================================================
 // START BOT
 // ============================================================
-
 function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
@@ -555,7 +496,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     isDonutSmp,
     donutSmpVerificationRetries: 0,
     connectedSince: null,
-    // Timestamp until which all outgoing activity is suppressed (DonutSMP only).
     donutSmpQuietUntil: 0,
   };
 
@@ -602,10 +542,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
-        // Disable mineflayer's own physics tick during quiet period —
-        // we toggle physicsEnabled on the bot object after login instead.
-        // checkTimeoutInterval: 0 prevents the internal "did not receive
-        // a packet in time" disconnect that can fire during chunk loading.
+        // Prevent mineflayer's internal packet-timeout check from firing
+        // during DonutSMP's intentionally slow chunk-load burst.
         checkTimeoutInterval: 30 * 1000,
       });
     } catch (err) {
@@ -619,11 +557,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.bot = bot;
     let kickHandled = false;
 
-    // ── Hunger ──────────────────────────────────────────────────
+    // ── Hunger ───────────────────────────────────────────────────────────────
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
-      // Suppress eating during DonutSMP quiet period
       if (isDonutSmp && Date.now() < entry.donutSmpQuietUntil) return;
       if (bot.food >= 18) return;
 
@@ -651,7 +588,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── Login ────────────────────────────────────────────────────
+    // ── Login ─────────────────────────────────────────────────────────────────
     bot.once("login", () => {
       if (!activeBots.has(botId)) return;
       console.log(`[botmanager] ✅ Bot logged in: ${minecraftUser} on ${host}:${port} (${versionToTry})`);
@@ -674,11 +611,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // ── DonutSMP post-login quiet period ──────────────────────
-        // Since the Jan 2 2026 update, DonutSMP kicks with "Invalid sequence"
-        // if the bot sends ANY packets (position, look, etc.) during the
-        // initial world-load burst. Disable physics and suppress eating until
-        // the quiet window expires.
+        // ── DonutSMP post-login quiet period ────────────────────────────────
+        // DonutSMP Paper 1.21.11 kicks with "Invalid sequence" if the bot
+        // sends ANY packet during the initial chunk-load burst. We disable
+        // mineflayer physics (stops automatic position packets) and send
+        // nothing ourselves.
+        //
+        // CRITICAL: Do NOT send minecraft:brand or any custom_payload here.
+        // mineflayer sends brand automatically during the login handshake.
+        // A duplicate brand causes the same "Invalid sequence" kick.
+        // We only resend the "settings" packet after the quiet window, since
+        // some versions of mineflayer omit it or send it too early.
         e.donutSmpQuietUntil = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
 
         if (bot.physicsEnabled !== undefined) {
@@ -687,37 +630,33 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
         console.log(
           `[botmanager] 🟠 DonutSMP login — quiet period active for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s ` +
-          `(physics disabled, no movement until ${new Date(e.donutSmpQuietUntil).toISOString()})`
+          `(physics disabled until ${new Date(e.donutSmpQuietUntil).toISOString()})`
         );
 
         setTimeout(() => {
           if (!activeBots.has(botId)) return;
-          if (entry.bot !== bot) return; // stale instance
+          if (entry.bot !== bot) return;
 
           if (bot.physicsEnabled !== undefined) {
             bot.physicsEnabled = true;
           }
           console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
 
-          // Send client settings + brand after the quiet period so the server
-          // sees a complete vanilla handshake without tripping the sequence guard.
-          setTimeout(() => {
-            if (!activeBots.has(botId)) return;
-            if (entry.bot !== bot) return;
-            sendClientSettings(bot, versionToTry);
-          }, DONUTSMP_SETTINGS_DELAY_MS);
+          // Resend client settings now that the server is fully ready.
+          // This is safe because Paper processes it idempotently.
+          sendClientSettings(bot);
 
         }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
         console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
 
       } else {
-        // Non-DonutSMP servers: send client settings immediately after login
-        // with a short delay to let the login sequence fully complete first.
+        // Non-DonutSMP: send client settings 1s after login.
+        // mineflayer sends brand automatically; we only need settings here.
         setTimeout(() => {
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return;
-          sendClientSettings(bot, versionToTry);
+          sendClientSettings(bot);
         }, 1000);
       }
 
@@ -726,22 +665,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── Spawn ────────────────────────────────────────────────────
-    // mineflayer fires 'spawn' after the bot has a position and the world
-    // is ready. We gate any further actions on the DonutSMP quiet period
-    // expiring so we don't accidentally trigger movement packets here.
+    // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
       if (isDonutSmp) {
-        // Movement / look will be handled after the quiet period ends.
-        // Nothing to do here for DonutSMP during the suppression window.
-        console.log(`[botmanager] 🟠 DonutSMP spawn event fired for ${minecraftUser} — waiting for quiet period to end before any actions`);
+        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet period active, holding all actions`);
       }
-      // For non-DonutSMP servers nothing special is needed here;
-      // client settings were already sent in the login handler.
     });
 
-    // ── Kicked ───────────────────────────────────────────────────
+    // ── Kicked ───────────────────────────────────────────────────────────────
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
@@ -789,7 +721,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── Error ────────────────────────────────────────────────────
+    // ── Error ─────────────────────────────────────────────────────────────────
     bot.on("error", (err) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
@@ -842,7 +774,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── End ──────────────────────────────────────────────────────
+    // ── End ───────────────────────────────────────────────────────────────────
     bot.on("end", (reason) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
@@ -916,7 +848,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 // ============================================================
 // STOP / CLEANUP
 // ============================================================
-
 function stopBot(discordId, minecraftUser) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🛑 Stopping bot — discordId: ${discordId}, mc: ${minecraftUser}`);
@@ -978,7 +909,6 @@ function cleanupBot(botId, reason) {
 // ============================================================
 // STATUS / LIST
 // ============================================================
-
 function getBotStatus(discordId, minecraftUser) {
   const botId = makeBotId(discordId, minecraftUser);
   const entry = activeBots.get(botId);
