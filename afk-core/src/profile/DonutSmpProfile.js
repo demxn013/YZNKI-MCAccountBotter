@@ -10,12 +10,17 @@ const { HungerHandler } = require("../behavior/HungerHandler");
  * - Vanilla-like brand and protocol version.
  * - Gentle idle movement (random look) to avoid looking like a frozen bot.
  * - Automatic hunger management — eats food when a hunger bar is lost.
- * - Explicit keep_alive echo to prevent "Invalid sequence" kicks.
- *   DonutSMP (Paper 1.21.x) enforces that the client responds to every
- *   keep_alive with the exact same keepAliveId. minecraft-protocol's
- *   built-in handler is correct, but sending an additional explicit
- *   response here acts as a belt-and-suspenders guard against the server's
- *   strict sequencing enforcement.
+ *
+ * NOTE on keep_alive:
+ *   minecraft-protocol already handles keep_alive echoing internally and
+ *   does so correctly. Adding a second explicit echo here causes DonutSMP's
+ *   Paper anti-cheat to see a DUPLICATE keep_alive response, which is what
+ *   actually triggers the "Invalid sequence" kick. Do NOT re-echo keep_alive.
+ *
+ * NOTE on look packet yaw:
+ *   minecraft-protocol's "look" packet expects yaw in DEGREES (0–360), not
+ *   radians. Sending radian values (−π to π) produced malformed yaw angles
+ *   which anti-cheat flagged as impossible movement.
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
@@ -49,9 +54,6 @@ class DonutSmpProfile extends BaseProfile {
       ...baseOptions,
       version: effectiveVersion,
       brand: "vanilla",
-      // Disable minecraft-protocol's built-in keep-alive auto-response so we
-      // can handle it ourselves and guarantee the exact correct keepAliveId
-      // is echoed back without any timing race.
       hideErrors: false,
       skipValidation: false,
     };
@@ -63,22 +65,11 @@ class DonutSmpProfile extends BaseProfile {
     this._hungerHandler = new HungerHandler(version);
     this._hungerHandler.attach(client);
 
-    // ── Keep-alive explicit echo ────────────────────────────────────────────
-    // DonutSMP enforces strict keep-alive sequence numbers. We listen for the
-    // raw keep_alive packet and immediately write the response ourselves.
-    // minecraft-protocol also handles this internally, but being explicit here
-    // avoids any edge-case timing issue that triggers the "Invalid sequence" kick.
-    //
-    // The keep_alive packet in 1.9+ carries a `keepAliveId` (Long). We echo it
-    // back verbatim. If the write throws (e.g. client already disconnecting) we
-    // silently ignore it — the server will kick us anyway in that case.
-    client.on("keep_alive", (packet) => {
-      try {
-        client.write("keep_alive", { keepAliveId: packet.keepAliveId });
-      } catch {
-        // Ignore — client is likely already closing.
-      }
-    });
+    // ── keep_alive ──────────────────────────────────────────────────────────
+    // minecraft-protocol handles keep_alive responses automatically and
+    // correctly. We intentionally do NOT add another echo here — sending a
+    // second response causes Paper's strict sequence checker to see an
+    // unexpected duplicate and kick with "Invalid sequence".
 
     // Placeholder for handling DonutSMP-specific plugin channels.
     client.on("plugin_message", () => {
@@ -98,11 +89,15 @@ class DonutSmpProfile extends BaseProfile {
     if (session.state !== "online") return;
 
     // Very lightweight random-look behavior every 10–20 seconds.
+    // Yaw must be in DEGREES (0–360). minecraft-protocol's "look" packet
+    // field is degrees, not radians. Sending radian values (~−3.14 to 3.14)
+    // was producing near-zero or negative angles that anti-cheat flagged.
     if (!this._lastMoveAt || nowMs - this._lastMoveAt > 10000) {
       this._lastMoveAt = nowMs;
       try {
-        const yaw = (Math.random() * Math.PI * 2) - Math.PI;
-        const pitch = (Math.random() * 0.6) - 0.3; // small up/down
+        // Random yaw: 0–360 degrees. Small pitch variation: ±10 degrees.
+        const yaw   = Math.random() * 360;
+        const pitch = (Math.random() * 20) - 10;
         client.write("look", {
           yaw,
           pitch,

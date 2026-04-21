@@ -188,6 +188,10 @@ const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 // 10s covers the window reliably.
 const DONUTSMP_POST_LOGIN_QUIET_MS = 10000;
 
+// Delay (ms) after the quiet period before we send client settings +
+// brand. Gives the server a moment to settle after the quiet window.
+const DONUTSMP_SETTINGS_DELAY_MS = 500;
+
 function isDonutSmpHost(host) {
   if (!host) return false;
   const lower = host.toLowerCase();
@@ -441,6 +445,54 @@ function makeBotId(discordId, minecraftUser) {
 }
 
 // ============================================================
+// CLIENT SETTINGS SENDER
+//
+// Sends the vanilla client settings packet that servers expect after
+// login. Missing or delayed client settings is a common cause of
+// "Invalid sequence" kicks on Paper/anti-cheat servers.
+//
+// Also sends the minecraft:brand plugin channel so the server sees
+// us as a vanilla client rather than a headless bot.
+// ============================================================
+function sendClientSettings(bot, version) {
+  try {
+    // The packet name and field names vary slightly by version but
+    // mineflayer's internal _client exposes the version-aware writer.
+    bot._client.write("settings", {
+      locale: "en_US",
+      viewDistance: 8,
+      chatFlags: 0,        // enabled
+      chatColors: true,
+      skinParts: 127,      // all skin layers visible
+      mainHand: 1,         // right hand
+      enableTextFiltering: false,
+      enableServerListing: true,
+    });
+    console.log(`[botmanager] 📋 Sent client settings for ${bot.username}`);
+  } catch (err) {
+    // Non-fatal — older versions may not support all fields.
+    console.warn(`[botmanager] ⚠️ Could not send client settings for ${bot.username}:`, err.message);
+  }
+
+  try {
+    // Send minecraft:brand plugin channel — tells the server we are a
+    // vanilla client. Servers like DonutSMP expect this shortly after login.
+    // The payload is a length-prefixed UTF-8 string "vanilla".
+    const brand = "vanilla";
+    const brandBuf = Buffer.alloc(1 + brand.length);
+    brandBuf.writeUInt8(brand.length, 0);
+    brandBuf.write(brand, 1, "utf8");
+    bot._client.write("custom_payload", {
+      channel: "minecraft:brand",
+      data: brandBuf,
+    });
+    console.log(`[botmanager] 📦 Sent minecraft:brand for ${bot.username}`);
+  } catch (err) {
+    console.warn(`[botmanager] ⚠️ Could not send brand for ${bot.username}:`, err.message);
+  }
+}
+
+// ============================================================
 // START BOT
 // ============================================================
 
@@ -550,6 +602,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+        // Disable mineflayer's own physics tick during quiet period —
+        // we toggle physicsEnabled on the bot object after login instead.
+        // checkTimeoutInterval: 0 prevents the internal "did not receive
+        // a packet in time" disconnect that can fire during chunk loading.
+        checkTimeoutInterval: 30 * 1000,
       });
     } catch (err) {
       console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
@@ -617,7 +674,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // ── DonutSMP post-login quiet period ──────────────────
+        // ── DonutSMP post-login quiet period ──────────────────────
         // Since the Jan 2 2026 update, DonutSMP kicks with "Invalid sequence"
         // if the bot sends ANY packets (position, look, etc.) during the
         // initial world-load burst. Disable physics and suppress eating until
@@ -636,18 +693,52 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         setTimeout(() => {
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return; // stale instance
+
           if (bot.physicsEnabled !== undefined) {
             bot.physicsEnabled = true;
           }
           console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
+
+          // Send client settings + brand after the quiet period so the server
+          // sees a complete vanilla handshake without tripping the sequence guard.
+          setTimeout(() => {
+            if (!activeBots.has(botId)) return;
+            if (entry.bot !== bot) return;
+            sendClientSettings(bot, versionToTry);
+          }, DONUTSMP_SETTINGS_DELAY_MS);
+
         }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
         console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
+
+      } else {
+        // Non-DonutSMP servers: send client settings immediately after login
+        // with a short delay to let the login sequence fully complete first.
+        setTimeout(() => {
+          if (!activeBots.has(botId)) return;
+          if (entry.bot !== bot) return;
+          sendClientSettings(bot, versionToTry);
+        }, 1000);
       }
 
       if (typeof onLinkVerified === "function") {
         try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
       }
+    });
+
+    // ── Spawn ────────────────────────────────────────────────────
+    // mineflayer fires 'spawn' after the bot has a position and the world
+    // is ready. We gate any further actions on the DonutSMP quiet period
+    // expiring so we don't accidentally trigger movement packets here.
+    bot.once("spawn", () => {
+      if (!activeBots.has(botId)) return;
+      if (isDonutSmp) {
+        // Movement / look will be handled after the quiet period ends.
+        // Nothing to do here for DonutSMP during the suppression window.
+        console.log(`[botmanager] 🟠 DonutSMP spawn event fired for ${minecraftUser} — waiting for quiet period to end before any actions`);
+      }
+      // For non-DonutSMP servers nothing special is needed here;
+      // client settings were already sent in the login handler.
     });
 
     // ── Kicked ───────────────────────────────────────────────────
