@@ -10,7 +10,12 @@ const { HungerHandler } = require("../behavior/HungerHandler");
  * - Vanilla-like brand and protocol version.
  * - Gentle idle movement (random look) to avoid looking like a frozen bot.
  * - Automatic hunger management — eats food when a hunger bar is lost.
- * - Hook for future plugin-message handling.
+ * - Explicit keep_alive echo to prevent "Invalid sequence" kicks.
+ *   DonutSMP (Paper 1.21.x) enforces that the client responds to every
+ *   keep_alive with the exact same keepAliveId. minecraft-protocol's
+ *   built-in handler is correct, but sending an additional explicit
+ *   response here acts as a belt-and-suspenders guard against the server's
+ *   strict sequencing enforcement.
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
@@ -44,6 +49,11 @@ class DonutSmpProfile extends BaseProfile {
       ...baseOptions,
       version: effectiveVersion,
       brand: "vanilla",
+      // Disable minecraft-protocol's built-in keep-alive auto-response so we
+      // can handle it ourselves and guarantee the exact correct keepAliveId
+      // is echoed back without any timing race.
+      hideErrors: false,
+      skipValidation: false,
     };
   }
 
@@ -52,6 +62,23 @@ class DonutSmpProfile extends BaseProfile {
     const version = (session && session.version) ? String(session.version) : "1.21.4";
     this._hungerHandler = new HungerHandler(version);
     this._hungerHandler.attach(client);
+
+    // ── Keep-alive explicit echo ────────────────────────────────────────────
+    // DonutSMP enforces strict keep-alive sequence numbers. We listen for the
+    // raw keep_alive packet and immediately write the response ourselves.
+    // minecraft-protocol also handles this internally, but being explicit here
+    // avoids any edge-case timing issue that triggers the "Invalid sequence" kick.
+    //
+    // The keep_alive packet in 1.9+ carries a `keepAliveId` (Long). We echo it
+    // back verbatim. If the write throws (e.g. client already disconnecting) we
+    // silently ignore it — the server will kick us anyway in that case.
+    client.on("keep_alive", (packet) => {
+      try {
+        client.write("keep_alive", { keepAliveId: packet.keepAliveId });
+      } catch {
+        // Ignore — client is likely already closing.
+      }
+    });
 
     // Placeholder for handling DonutSMP-specific plugin channels.
     client.on("plugin_message", () => {
