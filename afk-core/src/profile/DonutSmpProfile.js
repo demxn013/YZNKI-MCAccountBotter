@@ -21,6 +21,12 @@ const { HungerHandler } = require("../behavior/HungerHandler");
  *   The previous code sent radians (−π to π ≈ −3.14 to 3.14) which
  *   caused near-zero malformed yaw angles that anti-cheat flagged.
  *   Fixed to use degrees.
+ *
+ * NOTE on tick() look packets:
+ *   tick() now checks session.donutSmpReadyAt (set by botmanager's
+ *   installDonutSmpQuietProxy) before sending any look packets. This
+ *   prevents the profile from sending movement before the quiet window
+ *   + physics resume delay has fully elapsed.
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
@@ -83,11 +89,18 @@ class DonutSmpProfile extends BaseProfile {
   tick(session, client, nowMs) {
     if (session.state !== "online") return;
 
+    // Do not send any look packets until the botmanager's quiet window
+    // AND physics resume delay have fully elapsed. donutSmpReadyAt is set
+    // by installDonutSmpQuietProxy; 0 means not yet initialized (stay quiet).
+    const readyAt = session.donutSmpReadyAt || 0;
+    if (readyAt === 0 || nowMs < readyAt) return;
+
     // Gentle random-look every 10–20 seconds to avoid appearing frozen.
     // Yaw MUST be in degrees (0–360). The previous code used radians
     // which produced values like −3.14 to 3.14 — near-zero in degrees —
     // which anti-cheat detected as impossible/stuck movement.
-    if (!this._lastMoveAt || nowMs - this._lastMoveAt > 10000) {
+    const moveInterval = 10000 + Math.floor(Math.random() * 10000);
+    if (!this._lastMoveAt || nowMs - this._lastMoveAt > moveInterval) {
       this._lastMoveAt = nowMs;
       try {
         const yaw   = Math.random() * 360;          // 0–360 degrees

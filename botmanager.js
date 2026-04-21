@@ -151,32 +151,25 @@ const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
-// How long after login to hold the quiet window.
-// During this window we suppress position/look/flying/pong packets
-// that confuse DonutSMP's sequence checker during chunk loading.
-// keep_alive echo is still allowed (server will kick if we miss it).
-// teleport_confirm is still allowed (required to unfreeze the player).
-// custom_payload/brand and settings are allowed (sent once, harmless).
-const DONUTSMP_POST_LOGIN_QUIET_MS = 15000;
+// How long after login to suppress packets.
+// Increased from 15s → 30s: DonutSMP's chunk loading + sequence
+// checker needs more time to settle before we send anything.
+const DONUTSMP_POST_LOGIN_QUIET_MS = 30000;
+
+// Additional delay after quiet window before re-enabling physics.
+// Gives mineflayer's internal state time to sync before it starts
+// emitting position packets, avoiding a burst right at quiet-end.
+const DONUTSMP_PHYSICS_RESUME_DELAY_MS = 3000;
 
 // Packets suppressed during the quiet window (dropped entirely).
-// These are the ones that carry or affect sequence counters on DonutSMP.
 const DONUTSMP_QUIET_SUPPRESS = new Set([
-  "pong",        // ping/pong sequence — DonutSMP tracks these
-  "position",    // player movement
-  "look",        // head rotation
+  "pong",          // ping/pong sequence — DonutSMP tracks these
+  "position",      // player movement
+  "look",          // head rotation
   "position_look", // combined move+look
-  "flying",      // on-ground packet
+  "flying",        // on-ground packet
+  "settings",      // client settings — can trigger sequence tracking on DonutSMP
 ]);
-
-// Packets always allowed through even during quiet window.
-// Everything not in SUPPRESS is allowed, but we explicitly list
-// the critical ones to make the intent clear.
-// "keep_alive" — must echo or server kicks for timeout
-// "teleport_confirm" — must respond or server freezes/kicks player
-// "custom_payload" — brand sent once on login
-// "settings" — client settings sent once
-// All others pass through by default (chat, transaction, etc.)
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -421,7 +414,7 @@ function makeBotId(discordId, minecraftUser) {
 }
 
 // ============================================================
-// CLIENT SETTINGS SENDER
+// CLIENT SETTINGS SENDER (non-DonutSMP only)
 // ============================================================
 function sendClientSettings(bot, username, context) {
   const ctx = context || "unknown";
@@ -447,36 +440,30 @@ function sendClientSettings(bot, username, context) {
 // DONUTSMP QUIET WINDOW
 //
 // ROOT CAUSE: DonutSMP runs a strict packet sequence checker.
-// During the post-login chunk loading burst:
-//   1. "pong" packets (responses to server "ping") — DonutSMP sends
-//      ~20 ping/s; each pong increments a server-side sequence counter.
-//      Sending them all at once or out of order desynchronizes it.
-//   2. "position" / "look" / "flying" packets — mineflayer's physics
-//      engine fires these every tick even during chunk load. DonutSMP
-//      tracks these against a separate interaction sequence and flags
-//      unexpected movement during loading as suspicious.
+// The quiet window suppresses all packets that affect DonutSMP's
+// sequence counters during and after chunk loading.
 //
-// THE FIX: Replace bot._client.write with a proxy for the duration
-// of the quiet window. Packets in DONUTSMP_QUIET_SUPPRESS are dropped
-// entirely (not queued — queuing pongs causes the same desync problem
-// because they all arrive at once). Packets not in the suppress list
-// (keep_alive, teleport_confirm, custom_payload, settings, etc.) pass
-// through normally.
-//
-// After the quiet window:
-//   - Restore original write
-//   - Re-enable physics
-//   - Send client settings
-//
-// We do NOT flush suppressed packets — DonutSMP's ping flood stops
-// naturally once the server finishes chunk loading, so there's nothing
-// to replay. The server will simply send fresh pings after that.
+// KEY CHANGES vs previous version:
+//   - Quiet window extended to 30s (was 15s) — chunk loading needs
+//     more time to fully settle before any packets are safe to send.
+//   - "settings" added to suppress list — client settings can
+//     trigger a sequence check on DonutSMP's plugin layer.
+//   - Physics re-enable is deferred by DONUTSMP_PHYSICS_RESUME_DELAY_MS
+//     (3s) after the quiet window ends, preventing an immediate burst
+//     of position packets at the moment the proxy is removed.
+//   - No client settings are sent on DonutSMP at all (ever) — the
+//     server does not require them and they risk triggering the checker.
+//   - DonutSmpProfile.tick() respects entry.donutSmpReadyAt before
+//     sending any look packets, controlled via a timestamp set here.
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   const quietStart = Date.now();
   const quietEnd = quietStart + DONUTSMP_POST_LOGIN_QUIET_MS;
 
   entry.donutSmpQuietUntil = quietEnd;
+  // Mark when it's truly safe for the profile tick to send look packets.
+  // This is quiet window + physics resume delay + a small extra buffer.
+  entry.donutSmpReadyAt = quietEnd + DONUTSMP_PHYSICS_RESUME_DELAY_MS + 2000;
 
   // Disable mineflayer physics to stop position/look spam at the source.
   if (bot.physicsEnabled !== undefined) {
@@ -504,26 +491,31 @@ function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
     if (!activeBots.has(botId)) return;
     if (entry.bot !== bot) return;
 
-    // Restore original write immediately.
+    // Restore original write — packets can now flow normally.
     bot._client.write = origWrite;
-
-    // Re-enable physics.
-    if (bot.physicsEnabled !== undefined) {
-      bot.physicsEnabled = true;
-      console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled`);
-    }
-
     entry.donutSmpQuietUntil = 0;
 
-    console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — resuming normal operation`);
+    console.log(
+      `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed — ` +
+      `physics re-enable in ${DONUTSMP_PHYSICS_RESUME_DELAY_MS / 1000}s`
+    );
 
-    // Send client settings shortly after quiet window ends.
+    // Stagger physics re-enable: give the server a moment after we start
+    // accepting packets before mineflayer's tick loop floods position updates.
     setTimeout(() => {
       if (!activeBots.has(botId)) return;
       if (entry.bot !== bot) return;
-      console.log(`[botmanager] 🟠 [${minecraftUser}] Sending client settings after post-quiet delay`);
-      sendClientSettings(bot, minecraftUser, "donutsmp-post-quiet");
-    }, 500);
+
+      if (bot.physicsEnabled !== undefined) {
+        bot.physicsEnabled = true;
+        console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled`);
+      }
+
+      console.log(`[botmanager] 🟠 [${minecraftUser}] DonutSMP fully settled — normal operation resumed`);
+      // NOTE: We intentionally do NOT send client settings on DonutSMP.
+      // The server does not require them and sending them risks triggering
+      // DonutSMP's sequence checker post-quiet-window.
+    }, DONUTSMP_PHYSICS_RESUME_DELAY_MS);
 
   }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
@@ -593,6 +585,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     donutSmpVerificationRetries: 0,
     connectedSince: null,
     donutSmpQuietUntil: 0,
+    // Timestamp after which DonutSmpProfile.tick() may send look packets.
+    // Set by installDonutSmpQuietProxy; 0 = not yet connected.
+    donutSmpReadyAt: 0,
   };
 
   activeBots.set(botId, entry);
@@ -620,6 +615,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.version = versionToTry;
     entry.connectedSince = null;
     entry.donutSmpQuietUntil = 0;
+    entry.donutSmpReadyAt = 0;
 
     if (entry.donutSmpVerificationRetries > 0) {
       console.log(
@@ -655,8 +651,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
-      // Don't eat during DonutSMP quiet window — equip/consume sends packets
-      if (isDonutSmp && Date.now() < entry.donutSmpQuietUntil) return;
+      // Don't eat during DonutSMP quiet window or before ready
+      if (isDonutSmp && Date.now() < entry.donutSmpReadyAt) return;
       if (bot.food >= 18) return;
 
       const foodItem = bot.inventory.items().find(
@@ -706,8 +702,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install the quiet proxy — suppresses pong/position/look/flying
-        // during chunk loading to prevent "Invalid sequence" kicks.
+        // Install the quiet proxy — suppresses all sequence-sensitive packets
+        // during chunk loading. Physics re-enable is staggered after proxy removal.
         installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
 
         console.log(
