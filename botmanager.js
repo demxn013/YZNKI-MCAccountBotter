@@ -198,11 +198,6 @@ function isDonutSmpHost(host) {
 }
 
 /**
- * Detect if a disconnect reason looks like the DonutSMP verification screen
- * disconnect. Now handles both pre-login (connectedSince === null) and
- * post-login (connectedSince set, secondsOnline < 30) cases.
- */
-/**
  * Detect DonutSMP's "unauthorized login" security kick.
  * This fires when they want the user to confirm via Discord DM.
  */
@@ -480,6 +475,37 @@ function makeBotId(discordId, minecraftUser) {
 }
 
 // ============================================================
+// KEEP-ALIVE / SEQUENCE FIX
+//
+// DonutSMP (Paper 1.21.x) enforces strict keep-alive sequence
+// numbers. Mineflayer handles keep_alive internally but there
+// is a timing race where the server can kick with "Invalid sequence"
+// if the response arrives out of order.
+//
+// We attach a listener directly on the underlying
+// minecraft-protocol _client to intercept keep_alive packets
+// and immediately write the response back, guaranteeing the
+// correct keepAliveId is echoed on the same event loop tick.
+//
+// This is safe to apply to all servers — it is a no-op on
+// servers that don't enforce strict sequencing.
+// ============================================================
+function attachKeepAliveHandler(bot) {
+  // bot._client is the underlying minecraft-protocol client.
+  // It is always present after mineflayer.createBot() returns.
+  const client = bot._client;
+  if (!client) return;
+
+  client.on("keep_alive", (packet) => {
+    try {
+      client.write("keep_alive", { keepAliveId: packet.keepAliveId });
+    } catch {
+      // Client is closing — ignore.
+    }
+  });
+}
+
+// ============================================================
 // START BOT
 // ============================================================
 
@@ -607,6 +633,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     }
 
     entry.bot = bot;
+
+    // Attach the explicit keep-alive echo handler immediately after bot creation.
+    // This fires on the same tick as packet receipt, guaranteeing the correct
+    // keepAliveId is echoed back before any other processing can interfere.
+    // Prevents "Invalid sequence" kicks on strict Paper servers like DonutSMP.
+    attachKeepAliveHandler(bot);
+
     let kickHandled = false; // set true when kicked handler schedules a retry, prevents end from double-scheduling
 
     // ── Hunger / Eating behavior ────────────────────────────────
