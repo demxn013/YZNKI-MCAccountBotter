@@ -163,7 +163,6 @@ const DONUTSMP_PHYSICS_RESUME_DELAY_MS = 3000;
 
 // Packets suppressed during the quiet window (dropped entirely).
 const DONUTSMP_QUIET_SUPPRESS = new Set([
-  "pong",          // ping/pong sequence — DonutSMP tracks these
   "position",      // player movement
   "look",          // head rotation
   "position_look", // combined move+look

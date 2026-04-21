@@ -30,14 +30,14 @@ const { HungerHandler } = require("../behavior/HungerHandler");
  */
 class DonutSmpProfile extends BaseProfile {
   constructor() {
-    super("donutsmp", ["1.21.4"]);
+    super("donutsmp", ["1.21.11"]);
     this._lastMoveAt = 0;
     this._versionCache = new Map();
     this._hungerHandler = null;
   }
 
   _getCandidates() {
-    return ["1.21.4"];
+    return ["1.21.11"];
   }
 
   _resolveAutoVersion(hostLower) {
@@ -65,7 +65,7 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   attachHandlers(client, session) {
-    const version = (session && session.version) ? String(session.version) : "1.21.4";
+    const version = (session && session.version) ? String(session.version) : "1.21.11";
     this._hungerHandler = new HungerHandler(version);
     this._hungerHandler.attach(client);
 
@@ -81,7 +81,7 @@ class DonutSmpProfile extends BaseProfile {
     client.on("login", () => {
       const hostLower = String(session?.serverHost || "").toLowerCase();
       if (hostLower) {
-        this._versionCache.set(hostLower, String(session?.version || "1.21.4"));
+        this._versionCache.set(hostLower, String(session?.version || "1.21.11"));
       }
     });
   }
