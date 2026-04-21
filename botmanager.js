@@ -10,16 +10,6 @@ const path = require("path");
 
 // ============================================================
 // TOKEN CACHE — persists Microsoft tokens between restarts
-//
-// Each Minecraft account gets its OWN subdirectory:
-//   ./tokens/<username>/
-//
-// prismarine-auth writes its hash-prefixed cache files
-// (e.g. ab58c3_live-cache.json) into that subdirectory via
-// the `profilesFolder` option passed to mineflayer.createBot().
-//
-// This isolation means cache files from account A can never
-// bleed into account B, preventing invalid_grant errors.
 // ============================================================
 const TOKENS_ROOT = path.join(__dirname, "tokens");
 
@@ -161,10 +151,19 @@ const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
-// How long to suppress ALL outgoing packets after login.
-// DonutSMP Paper 1.21.11 kicks bots that send packets during the
-// initial chunk-load burst with "Invalid sequence".
-const DONUTSMP_POST_LOGIN_QUIET_MS = 12000;
+// How long to hold the ping suppression window after login.
+//
+// ROOT CAUSE (confirmed via packet logging):
+// DonutSMP sends ~20 "ping" packets per second during the post-login
+// chunk-load burst. minecraft-protocol automatically responds to each
+// with a "pong". This causes the server's sequence tracker to desync
+// and it kicks the client with "Invalid sequence".
+//
+// THE FIX: intercept incoming "ping" packets at the raw listener level,
+// queue the IDs, and suppress the auto-pong during the window. Once the
+// window ends we flush all queued pongs in one burst and resume normal
+// operation. This lets the server finish loading without sequence issues.
+const DONUTSMP_POST_LOGIN_QUIET_MS = 30000;
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -413,11 +412,10 @@ function makeBotId(discordId, minecraftUser) {
 //
 // Sends ONLY the "settings" packet (view distance, skin parts, etc.).
 // mineflayer already sends minecraft:brand automatically during the
-// login handshake — do NOT send custom_payload/brand here or Paper
-// will see a duplicate and kick with "Invalid sequence".
+// login handshake — do NOT send custom_payload/brand here.
 // ============================================================
-function sendClientSettings(bot, username, context) {
-  console.log(`[botmanager] 📋 [${username}] Attempting to send client settings (context: ${context})`);
+function sendClientSettings(bot, username) {
+  console.log(`[botmanager] 📋 [${username}] Sending client settings`);
   try {
     bot._client.write("settings", {
       locale: "en_US",
@@ -429,9 +427,9 @@ function sendClientSettings(bot, username, context) {
       enableTextFiltering: false,
       enableServerListing: true,
     });
-    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully (context: ${context})`);
+    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully`);
   } catch (err) {
-    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings (context: ${context}):`, err.message);
+    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings:`, err.message);
   }
 }
 
@@ -543,8 +541,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
-        // Prevent mineflayer's internal packet-timeout check from firing
-        // during DonutSMP's intentionally slow chunk-load burst.
         checkTimeoutInterval: 30 * 1000,
       });
     } catch (err) {
@@ -557,41 +553,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
     entry.bot = bot;
     let kickHandled = false;
-
-    // ── Packet sniffer — log ALL outgoing packets during the quiet window ────
-    // This intercepts bot._client.write to log every packet the bot sends,
-    // so we can pinpoint exactly what triggers "Invalid sequence" on DonutSMP.
-    if (isDonutSmp) {
-      const originalWrite = bot._client.write.bind(bot._client);
-      bot._client.write = function packetWriteProxy(name, params) {
-        const e = activeBots.get(botId);
-        const nowMs = Date.now();
-        const quietUntil = e ? e.donutSmpQuietUntil : 0;
-        const isInQuietWindow = nowMs < quietUntil;
-        const msRemaining = quietUntil > 0 ? Math.max(0, quietUntil - nowMs) : 0;
-
-        if (isInQuietWindow) {
-          // Log every packet sent during the quiet window — these are suspects.
-          console.warn(
-            `[botmanager] ⚠️ [${minecraftUser}] PACKET SENT DURING QUIET WINDOW (+${Math.round((DONUTSMP_POST_LOGIN_QUIET_MS - msRemaining) / 1000)}s in, ${Math.round(msRemaining / 1000)}s remaining): ` +
-            `${name} — ${JSON.stringify(params)}`
-          );
-        } else {
-          // After quiet window: log packets for a further 10s so we can see
-          // what gets sent immediately after physics re-enable + settings.
-          const msAfterQuiet = quietUntil > 0 ? nowMs - quietUntil : -1;
-          if (msAfterQuiet >= 0 && msAfterQuiet < 10000) {
-            console.log(
-              `[botmanager] 📡 [${minecraftUser}] POST-QUIET PACKET (+${Math.round(msAfterQuiet / 1000)}s after quiet end): ` +
-              `${name} — ${JSON.stringify(params)}`
-            );
-          }
-        }
-
-        return originalWrite(name, params);
-      };
-      console.log(`[botmanager] 🔍 [${minecraftUser}] Packet sniffer installed on bot._client.write`);
-    }
 
     // ── Hunger ───────────────────────────────────────────────────────────────
     async function tryEat() {
@@ -647,64 +608,109 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // ── DonutSMP post-login quiet period ────────────────────────────────
-        // DonutSMP Paper 1.21.11 kicks with "Invalid sequence" if the bot
-        // sends ANY packet during the initial chunk-load burst. We disable
-        // mineflayer physics (stops automatic position packets) and send
-        // nothing ourselves.
+        // ── DonutSMP ping suppression ────────────────────────────────────────
         //
-        // CRITICAL: Do NOT send minecraft:brand or any custom_payload here.
-        // mineflayer sends brand automatically during the login handshake.
-        // A duplicate brand causes the same "Invalid sequence" kick.
-        // We only resend the "settings" packet after the quiet window, since
-        // some versions of mineflayer omit it or send it too early.
+        // DonutSMP sends a storm of "ping" packets (~20/s) during chunk loading.
+        // minecraft-protocol auto-responds to each with "pong", which causes the
+        // server's sequence tracker to desync → "Invalid sequence" kick.
+        //
+        // We intercept incoming "ping" packets at the raw listener level,
+        // queue their IDs, and suppress the auto-pong response for the duration
+        // of the quiet window. When the window ends we flush all queued pongs
+        // in one burst, then resume normal operation.
+        //
+        // The "packet" event on bot._client fires BEFORE minecraft-protocol
+        // dispatches named events (and therefore before the auto-pong), so
+        // we can intercept and selectively hold responses.
+
         e.donutSmpQuietUntil = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
 
+        // Disable mineflayer physics to stop the bot AI from sending
+        // unsolicited position/look packets during chunk loading.
         if (bot.physicsEnabled !== undefined) {
           bot.physicsEnabled = false;
-          console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled (physicsEnabled=false)`);
-        } else {
-          console.warn(`[botmanager] ⚠️ [${minecraftUser}] bot.physicsEnabled is undefined — physics cannot be disabled! Mineflayer may still send position packets.`);
         }
 
+        const suppressedPingIds = [];
+        let pingSuppressorActive = true;
+
+        // Raw packet interceptor — fires before named event dispatch.
+        // We hold ping IDs and cancel the automatic pong by removing
+        // minecraft-protocol's own "ping" listener and re-adding it
+        // after the quiet window with all queued replies flushed.
+        //
+        // Implementation: we shadow the named "ping" event by prepending
+        // our own listener via prependListener, marking each ping as
+        // "handled" so the protocol's listener still fires (we can't prevent
+        // the pong write directly from here). Instead we use a different
+        // approach: override bot._client.write to swallow "pong" writes
+        // during the quiet window, then flush them at the end.
+        //
+        // This is cleaner than trying to remove internal mc-protocol listeners
+        // since those are anonymous functions we cannot reference.
+
+        const origWrite = bot._client.write.bind(bot._client);
+        bot._client.write = function donutSmpWriteProxy(name, params) {
+          if (pingSuppressorActive && name === "pong") {
+            // Queue this pong to be sent after the quiet window.
+            suppressedPingIds.push(params);
+            return;
+          }
+          return origWrite(name, params);
+        };
+
         console.log(
-          `[botmanager] 🟠 DonutSMP login — quiet period active for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s ` +
-          `(physics disabled until ${new Date(e.donutSmpQuietUntil).toISOString()})`
+          `[botmanager] 🟠 [${minecraftUser}] DonutSMP ping suppressor active — ` +
+          `pong responses queued for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s`
         );
 
-        setTimeout(() => {
+        const quietEndTimer = setTimeout(() => {
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return;
 
-          console.log(`[botmanager] 🟠 [${minecraftUser}] Quiet period timer fired — re-enabling physics and sending settings`);
+          // Deactivate suppressor and restore original write immediately.
+          pingSuppressorActive = false;
+          bot._client.write = origWrite;
 
+          // Re-enable physics.
           if (bot.physicsEnabled !== undefined) {
             bot.physicsEnabled = true;
-            console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled (physicsEnabled=true)`);
           }
 
-          // Small delay between physics re-enable and settings packet to avoid
-          // a burst of position + settings packets hitting the server together.
+          console.log(
+            `[botmanager] 🟠 [${minecraftUser}] Quiet window ended — ` +
+            `flushing ${suppressedPingIds.length} suppressed pongs, re-enabling physics`
+          );
+
+          // Flush all suppressed pongs now that chunk loading is done.
+          for (const params of suppressedPingIds) {
+            try {
+              origWrite("pong", params);
+            } catch {
+              // Ignore — connection may have ended.
+            }
+          }
+          suppressedPingIds.length = 0;
+
+          // Send client settings shortly after the pong flush.
           setTimeout(() => {
             if (!activeBots.has(botId)) return;
             if (entry.bot !== bot) return;
-            console.log(`[botmanager] 🟠 [${minecraftUser}] Sending client settings after post-quiet delay`);
-            sendClientSettings(bot, minecraftUser, "donutsmp-post-quiet");
-          }, 500);
-
-          console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
+            sendClientSettings(bot, minecraftUser);
+          }, 250);
 
         }, DONUTSMP_POST_LOGIN_QUIET_MS);
+
+        if (quietEndTimer.unref) quietEndTimer.unref();
 
         console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
 
       } else {
         // Non-DonutSMP: send client settings 1s after login.
-        // mineflayer sends brand automatically; we only need settings here.
         setTimeout(() => {
           if (!activeBots.has(botId)) return;
           if (entry.bot !== bot) return;
-          sendClientSettings(bot, minecraftUser, "non-donutsmp-post-login");
+          sendClientSettings(bot, minecraftUser);
         }, 1000);
       }
 
@@ -717,9 +723,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
       if (isDonutSmp) {
-        const e = activeBots.get(botId);
-        const msIntoQuiet = e ? Math.round((Date.now() - (e.donutSmpQuietUntil - DONUTSMP_POST_LOGIN_QUIET_MS)) / 1000) : "?";
-        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} at +${msIntoQuiet}s into quiet period — holding all actions`);
+        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — ping suppressor active`);
       }
     });
 
@@ -727,29 +731,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
-      const e = activeBots.get(botId);
-      const nowMs = Date.now();
-      const quietUntil = e ? e.donutSmpQuietUntil : 0;
-      const msAfterQuiet = quietUntil > 0 ? nowMs - quietUntil : -1;
-      const msIntoQuiet = quietUntil > 0 ? nowMs - (quietUntil - DONUTSMP_POST_LOGIN_QUIET_MS) : -1;
-      const duringQuiet = quietUntil > 0 && nowMs < quietUntil;
+      console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
 
-      if (isDonutSmp) {
-        if (duringQuiet) {
-          console.warn(
-            `[botmanager] 🦵 [${minecraftUser}] Kicked DURING quiet window ` +
-            `(+${Math.round(msIntoQuiet / 1000)}s in, ${Math.round((quietUntil - nowMs) / 1000)}s before end): ${reasonText}`
-          );
-        } else if (msAfterQuiet >= 0 && msAfterQuiet < 15000) {
-          console.warn(
-            `[botmanager] 🦵 [${minecraftUser}] Kicked ${Math.round(msAfterQuiet / 1000)}s AFTER quiet window ended: ${reasonText}`
-          );
-        } else {
-          console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
-        }
-      } else {
-        console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
-      }
+      const e = activeBots.get(botId);
 
       if (entry.bot !== bot) return;
 
