@@ -37,6 +37,14 @@ app.use(express.json());
 
 const PORT = parseInt(process.env.PORT || "4823", 10);
 const API_KEY = process.env.API_KEY;
+const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
+const DONUTSMP_STRICT_VERSION = "1.21.11";
+
+function isDonutSmpHost(host) {
+  const lower = String(host || "").toLowerCase();
+  if (!lower) return false;
+  return DONUTSMP_HOST_PATTERNS.some((p) => lower.includes(p));
+}
 
 if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM_SECRET") {
   console.error("❌ FATAL: API_KEY is not set in .env. Refusing to start.");
@@ -149,11 +157,22 @@ app.post("/start", (req, res) => {
       }
     : null;
 
+  const requestedVersion = String(version || "auto").trim() || "auto";
+  let effectiveVersion = requestedVersion;
+  if (isDonutSmpHost(serverAddress)) {
+    if (requestedVersion.toLowerCase() !== "auto" && requestedVersion !== DONUTSMP_STRICT_VERSION) {
+      console.warn(
+        `[server] 🛡️ DonutSMP strict version override: requested ${requestedVersion} -> ${DONUTSMP_STRICT_VERSION}`
+      );
+    }
+    effectiveVersion = DONUTSMP_STRICT_VERSION;
+  }
+
   const result = startBot(
     discordId.trim(),
     minecraftUser.trim(),
     serverAddress.trim(),
-    (version || "1.21.4").trim(),
+    effectiveVersion,
     onDeviceCode,
     onLinkVerified
   );

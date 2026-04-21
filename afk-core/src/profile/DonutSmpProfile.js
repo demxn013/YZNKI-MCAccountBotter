@@ -32,8 +32,11 @@ class DonutSmpProfile extends BaseProfile {
   constructor() {
     super("donutsmp", ["1.21.11"]);
     this._lastMoveAt = 0;
+    this._lastYaw = Math.random() * 360;
     this._versionCache = new Map();
     this._hungerHandler = null;
+    this._debugLevel = String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase();
+    this._lastDebugLookAt = 0;
   }
 
   _getCandidates() {
@@ -74,8 +77,11 @@ class DonutSmpProfile extends BaseProfile {
     // We deliberately do NOT add another echo — a duplicate response causes
     // Paper's strict sequence checker to kick with "Invalid sequence".
 
-    client.on("plugin_message", () => {
-      // Future: handle DonutSMP-specific plugin channels if needed.
+    client.on("plugin_message", (packet) => {
+      if (this._debugLevel !== "forensic") return;
+      const channel = packet?.channel || "unknown";
+      const dataLen = packet?.data?.length != null ? packet.data.length : 0;
+      console.log(`[DonutSmpProfile] 🔬 plugin_message channel=${channel} bytes=${dataLen}`);
     });
 
     client.on("login", () => {
@@ -99,17 +105,23 @@ class DonutSmpProfile extends BaseProfile {
     // Yaw MUST be in degrees (0–360). The previous code used radians
     // which produced values like −3.14 to 3.14 — near-zero in degrees —
     // which anti-cheat detected as impossible/stuck movement.
-    const moveInterval = 10000 + Math.floor(Math.random() * 10000);
+    const moveInterval = 10000 + Math.floor(Math.random() * 15000);
     if (!this._lastMoveAt || nowMs - this._lastMoveAt > moveInterval) {
       this._lastMoveAt = nowMs;
       try {
-        const yaw   = Math.random() * 360;          // 0–360 degrees
+        const yawDelta = (Math.random() * 24) - 12;
+        const yaw = (this._lastYaw + yawDelta + 360) % 360;
+        this._lastYaw = yaw;
         const pitch = (Math.random() * 20) - 10;    // ±10 degrees
         client.write("look", {
           yaw,
           pitch,
           onGround: true,
         });
+        if (this._debugLevel === "forensic" && (nowMs - this._lastDebugLookAt) > 5000) {
+          this._lastDebugLookAt = nowMs;
+          console.log(`[DonutSmpProfile] 🔬 look sent yaw=${yaw.toFixed(2)} pitch=${pitch.toFixed(2)} readyAt=${readyAt} now=${nowMs}`);
+        }
       } catch {
         // Ignore movement errors.
       }

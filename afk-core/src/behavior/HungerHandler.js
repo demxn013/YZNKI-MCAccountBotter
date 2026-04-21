@@ -65,6 +65,8 @@ class HungerHandler {
     this.isEating = false;
     this.eatCooldown = 0;
     this.currentHeldSlot = 0;
+    this.interactionSequence = 0;
+    this._debugLevel = String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase();
 
     // Player inventory slot cache (46 slots for windowId 0):
     //   0        = crafting output
@@ -216,6 +218,9 @@ class HungerHandler {
 
     // Offhand: no slot switch needed, eat immediately.
     if (this._offhandHasFood()) {
+      if (this._debugLevel === "forensic") {
+        console.log("[HungerHandler] 🔬 Eating from offhand");
+      }
       this._doEat(client, 1 /* offhand */);
       return;
     }
@@ -228,6 +233,9 @@ class HungerHandler {
       try {
         client.write("held_item_slot", { slotId: hotbarSlot });
         this.currentHeldSlot = hotbarSlot;
+        if (this._debugLevel === "forensic") {
+          console.log(`[HungerHandler] 🔬 Switched hotbar slot to ${hotbarSlot}`);
+        }
       } catch {
         return;
       }
@@ -259,12 +267,18 @@ class HungerHandler {
     this.isEating = true;
 
     try {
-      // Most complete format (1.21.2+); extra fields ignored on older versions.
-      client.write("use_item", { hand, sequence: 0, yaw: 0.0, pitch: 0.0 });
+      // Do not send a fixed sequence number; let protocol defaults apply.
+      client.write("use_item", { hand });
+      if (this._debugLevel === "forensic") {
+        console.log(`[HungerHandler] 🔬 use_item sent hand=${hand} seq=omitted`);
+      }
     } catch {
-      // Fallback for versions that don't have yaw/pitch.
+      // Fallback for stricter serializers requiring sequence.
       try {
-        client.write("use_item", { hand, sequence: 0 });
+        client.write("use_item", { hand, sequence: this.interactionSequence++ });
+        if (this._debugLevel === "forensic") {
+          console.log(`[HungerHandler] 🔬 use_item fallback hand=${hand} seq=${this.interactionSequence - 1}`);
+        }
       } catch {
         // Final fallback for pre-1.19.4.
         try {
