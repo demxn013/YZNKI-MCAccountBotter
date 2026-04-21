@@ -173,23 +173,20 @@ const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
-// DONUTSMP VERIFICATION RECONNECT SETTINGS
-//
-// DonutSMP disconnects bots with "socketClosed" both BEFORE login
-// (connection-phase rejection) and shortly AFTER login (verification
-// screen). We now handle both cases with the same retry counter.
-//
-// Pre-login socketClosed: bot never fires `login`, connectedSince = null.
-// Post-login socketClosed: bot fired `login`, connectedSince is set,
-//   and secondsOnline < 30.
-//
-// Both cases are treated as verification-related and retried silently.
+// DONUTSMP SETTINGS
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
-// How many total socketClosed retries before giving up (pre + post login combined)
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
-// Delay between retries — 5 seconds as requested
-const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000; // 5 seconds
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
+
+// "Invalid sequence" fix — post Jan 2 2026 DonutSMP update:
+// Suppress ALL outgoing packets (movement, eating, etc.) for this
+// many milliseconds after login fires. DonutSMP kicks bots that send
+// any packets during the initial world/chunk loading burst.
+// 10 seconds is sufficient in practice; the article recommends
+// skipping ~2000 game ticks (100s) but wall-clock testing shows
+// 10s covers the window reliably.
+const DONUTSMP_POST_LOGIN_QUIET_MS = 10000;
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -197,10 +194,6 @@ function isDonutSmpHost(host) {
   return DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
 }
 
-/**
- * Detect DonutSMP's "unauthorized login" security kick.
- * This fires when they want the user to confirm via Discord DM.
- */
 function isDonutSmpVerificationKick(reasonText) {
   if (!reasonText) return false;
   const t = reasonText.toLowerCase();
@@ -217,10 +210,8 @@ function isDonutSmpVerificationDisconnect(reason, connectedSince) {
   const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
   if (!r.includes("socketclosed")) return false;
 
-  // Pre-login: connectedSince is null — bot never made it past the handshake
   if (connectedSince === null) return true;
 
-  // Post-login: bot was online for less than 30 seconds
   const secondsOnline = Math.floor((Date.now() - connectedSince) / 1000);
   return secondsOnline < 30;
 }
@@ -232,7 +223,7 @@ const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
 const versionCache = new Map();
 
 const SUPPORTED_VERSIONS = new Set([
-  "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
+  "1.21.11", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
   "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20",
   "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19",
   "1.18.2", "1.18.1", "1.18",
@@ -272,40 +263,33 @@ function saveVersionCache() {
 loadVersionCache();
 
 // ============================================================
-// HUNGER MANAGEMENT — food items the bot is allowed to eat.
-// Dangerous items (pufferfish, spider_eye, rotten_flesh,
-// poisonous_potato) are intentionally excluded.
+// HUNGER MANAGEMENT
 // ============================================================
 const BOT_FOOD_ITEMS = new Set([
-  // Cooked meats (preferred — high saturation)
   "cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton",
   "cooked_rabbit", "cooked_cod", "cooked_salmon",
-  // Raw meats
   "beef", "porkchop", "chicken", "mutton", "rabbit", "cod", "salmon",
-  // Bread & baked goods
   "bread", "cookie", "pumpkin_pie",
-  // Fruits & vegetables
   "apple", "golden_apple", "enchanted_golden_apple",
   "carrot", "golden_carrot", "melon_slice",
   "baked_potato", "potato", "beetroot",
   "sweet_berries", "glow_berries",
-  // Fish & seafood
   "tropical_fish", "dried_kelp",
-  // Misc
   "honey_bottle",
-  // Stews (non-stackable but valid)
   "mushroom_stew", "beetroot_soup", "rabbit_stew",
-  // Chorus fruit (teleports, but still fills hunger)
   "chorus_fruit",
 ]);
 
 // ============================================================
 // VERSION AUTO-DETECTION HELPERS
+//
+// 1.21.11 is first — required by DonutSMP since Jan 2026 update.
+// Servers that don't support it will rotate past it via the
+// version-mismatch kick handler.
 // ============================================================
-
 function getAutoCandidatesForHost(hostLower) {
   return [
-    "1.21.4", "1.21.1", "1.21",
+    "1.21.11", "1.21.4", "1.21.1", "1.21",
     "1.20.6", "1.20.4", "1.20.1",
     "1.19.4", "1.19.2",
     "1.18.2", "1.17.1", "1.16.5",
@@ -346,19 +330,12 @@ function parseServerAddress(serverAddress) {
 
 function isFatalNetworkError(errCode, errMessage) {
   const FATAL_CODES = new Set([
-    "ENOTFOUND",
-    "EAI_AGAIN",
-    "EAI_NONAME",
-    "ECONNREFUSED",
-    "ENETUNREACH",
-    "EHOSTUNREACH",
+    "ENOTFOUND", "EAI_AGAIN", "EAI_NONAME",
+    "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH",
   ]);
-
   if (errCode && FATAL_CODES.has(errCode)) return true;
-
   const msg = (errMessage || "").toLowerCase();
   if (msg.includes("enotfound") || msg.includes("getaddrinfo")) return true;
-
   return false;
 }
 
@@ -394,7 +371,6 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
     user_code: userCode,
     verification_uri: verificationUri,
     expires_in: expiresIn,
-    interval,
   } = deviceCodeResponse;
 
   const effectiveExpiresIn = expiresIn || 900;
@@ -405,12 +381,9 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
         (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
       );
 
-  // ── Guard: kill immediately if a second code fires ─────────
   if (entry && entry.deviceCodeEmitted) {
     console.warn(`[botmanager] 🛑 Second device code fired for ${minecraftUser} — killing bot. User must run /mcbot start again.`);
-
     clearAuthCache(minecraftUser);
-
     if (entry.spawnTimeoutId) {
       clearTimeout(entry.spawnTimeoutId);
       entry.spawnTimeoutId = null;
@@ -419,17 +392,14 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
     entry.spawnError =
       "Microsoft authentication failed — the sign-in session could not be completed. " +
       "Please run /mcbot start again to receive a fresh login code.";
-
     if (botId) {
       setTimeout(() => cleanupBot(botId, "auth_second_code"), 0);
     }
     return;
   }
 
-  // ── First code — mark as emitted and extend spawn timeout ──
   if (entry) {
     entry.deviceCodeEmitted = true;
-
     if (entry.spawnTimeoutId) {
       clearTimeout(entry.spawnTimeoutId);
     }
@@ -466,43 +436,8 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
 // BOT ID HELPER
 // ============================================================
 
-/**
- * Compute the canonical bot key for the activeBots map.
- * Format: `${discordId}:${minecraftUser.toLowerCase()}`
- */
 function makeBotId(discordId, minecraftUser) {
   return `${discordId}:${minecraftUser.toLowerCase()}`;
-}
-
-// ============================================================
-// KEEP-ALIVE / SEQUENCE FIX
-//
-// DonutSMP (Paper 1.21.x) enforces strict keep-alive sequence
-// numbers. Mineflayer handles keep_alive internally but there
-// is a timing race where the server can kick with "Invalid sequence"
-// if the response arrives out of order.
-//
-// We attach a listener directly on the underlying
-// minecraft-protocol _client to intercept keep_alive packets
-// and immediately write the response back, guaranteeing the
-// correct keepAliveId is echoed on the same event loop tick.
-//
-// This is safe to apply to all servers — it is a no-op on
-// servers that don't enforce strict sequencing.
-// ============================================================
-function attachKeepAliveHandler(bot) {
-  // bot._client is the underlying minecraft-protocol client.
-  // It is always present after mineflayer.createBot() returns.
-  const client = bot._client;
-  if (!client) return;
-
-  client.on("keep_alive", (packet) => {
-    try {
-      client.write("keep_alive", { keepAliveId: packet.keepAliveId });
-    } catch {
-      // Client is closing — ignore.
-    }
-  });
 }
 
 // ============================================================
@@ -537,12 +472,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const { host, port } = parseServerAddress(serverAddress);
   const hostLower = String(host || "").toLowerCase();
-  const requestedVersion = (version || "1.21.4").trim();
+  const requestedVersion = (version || "1.21.11").trim();
   const autoMode = requestedVersion.toLowerCase() === "auto";
   const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
   const cached = autoMode ? versionCache.get(hostLower) : null;
   let effectiveVersion = autoMode
-    ? (cached || autoCandidates[0] || "1.21.4")
+    ? (cached || autoCandidates[0] || "1.21.11")
     : requestedVersion;
 
   let autoVersionIndex = autoMode
@@ -550,8 +485,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     : -1;
 
   const tokenDir = ensureAccountDir(minecraftUser);
-
-  // Track whether this is a DonutSMP server for special reconnect handling
   const isDonutSmp = isDonutSmpHost(hostLower);
 
   const entry = {
@@ -567,31 +500,25 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     spawnTimeoutId: null,
     deviceCodeEmitted: false,
     bot: null,
-    // DonutSMP verification retry tracking
-    // Counts ALL socketClosed retries regardless of whether login fired
     isDonutSmp,
     donutSmpVerificationRetries: 0,
-    connectedSince: null, // set when login fires; null = pre-login
+    connectedSince: null,
+    // Timestamp until which all outgoing activity is suppressed (DonutSMP only).
+    donutSmpQuietUntil: 0,
   };
 
   activeBots.set(botId, entry);
 
-  // ── Hunger state — persists across reconnects for this bot session ──
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // ── Initial spawn timeout ──────────────────────────────────
-  // For DonutSMP: 90s gives all 10 retries (5s delay + ~4s connect window each)
-  // room to complete. If verification isn't done by then, we give up and tell the user.
   const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
     const e = activeBots.get(botId);
-    // Fire on both "connecting" and "reconnecting" — "reconnecting" means a
-    // DonutSMP retry loop is in progress; we must terminate it after the deadline.
     if (e.status !== "connecting" && e.status !== "reconnecting") return;
-    if (e.deviceCodeEmitted) return; // auth timeout handled separately
+    if (e.deviceCodeEmitted) return;
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s (${e.donutSmpVerificationRetries} retries attempted) — giving up`);
     e.spawnError = isDonutSmp
       ? "DonutSMP security check timed out — the verification was not completed in time. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
@@ -603,8 +530,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   function spawnBot(versionToTry) {
     entry.version = versionToTry;
-    // Reset connected timestamp on each spawn attempt
     entry.connectedSince = null;
+    entry.donutSmpQuietUntil = 0;
 
     if (entry.donutSmpVerificationRetries > 0) {
       console.log(
@@ -633,20 +560,14 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     }
 
     entry.bot = bot;
+    let kickHandled = false;
 
-    // Attach the explicit keep-alive echo handler immediately after bot creation.
-    // This fires on the same tick as packet receipt, guaranteeing the correct
-    // keepAliveId is echoed back before any other processing can interfere.
-    // Prevents "Invalid sequence" kicks on strict Paper servers like DonutSMP.
-    attachKeepAliveHandler(bot);
-
-    let kickHandled = false; // set true when kicked handler schedules a retry, prevents end from double-scheduling
-
-    // ── Hunger / Eating behavior ────────────────────────────────
-
+    // ── Hunger ──────────────────────────────────────────────────
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
+      // Suppress eating during DonutSMP quiet period
+      if (isDonutSmp && Date.now() < entry.donutSmpQuietUntil) return;
       if (bot.food >= 18) return;
 
       const foodItem = bot.inventory.items().find(
@@ -659,10 +580,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         await bot.equip(foodItem, "hand");
         await bot.consume();
         eatCooldownUntil = Date.now() + 1500;
-        console.log(
-          `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} ` +
-          `(food: ${bot.food}/20)`
-        );
+        console.log(`[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} (food: ${bot.food}/20)`);
       } catch {
         // Ignore eating errors
       } finally {
@@ -676,16 +594,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── Standard bot events ─────────────────────────────────────
-
+    // ── Login ────────────────────────────────────────────────────
     bot.once("login", () => {
       if (!activeBots.has(botId)) return;
       console.log(`[botmanager] ✅ Bot logged in: ${minecraftUser} on ${host}:${port} (${versionToTry})`);
       const e = activeBots.get(botId);
 
-      // Clear the spawn timeout on successful login — bot is online, no need for it.
-      // For DonutSMP we kept it running during retries, but once login fires the bot
-      // is genuinely connected and the timeout must be cancelled.
       if (e.spawnTimeoutId) {
         clearTimeout(e.spawnTimeoutId);
         e.spawnTimeoutId = null;
@@ -693,7 +607,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       e.status = "online";
       e.version = versionToTry;
-      e.connectedSince = Date.now(); // record when we went online
+      e.connectedSince = Date.now();
 
       if (autoMode) {
         versionCache.set(hostLower, versionToTry);
@@ -703,6 +617,31 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
+        // ── DonutSMP post-login quiet period ──────────────────
+        // Since the Jan 2 2026 update, DonutSMP kicks with "Invalid sequence"
+        // if the bot sends ANY packets (position, look, etc.) during the
+        // initial world-load burst. Disable physics and suppress eating until
+        // the quiet window expires.
+        e.donutSmpQuietUntil = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
+
+        if (bot.physicsEnabled !== undefined) {
+          bot.physicsEnabled = false;
+        }
+
+        console.log(
+          `[botmanager] 🟠 DonutSMP login — quiet period active for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s ` +
+          `(physics disabled, no movement until ${new Date(e.donutSmpQuietUntil).toISOString()})`
+        );
+
+        setTimeout(() => {
+          if (!activeBots.has(botId)) return;
+          if (entry.bot !== bot) return; // stale instance
+          if (bot.physicsEnabled !== undefined) {
+            bot.physicsEnabled = true;
+          }
+          console.log(`[botmanager] 🟠 DonutSMP quiet period ended for ${minecraftUser} — physics re-enabled`);
+        }, DONUTSMP_POST_LOGIN_QUIET_MS);
+
         console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       }
 
@@ -711,6 +650,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
+    // ── Kicked ───────────────────────────────────────────────────
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
@@ -718,26 +658,19 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       const e = activeBots.get(botId);
 
-      // ── Guard: only process kicked events from the CURRENT bot instance.
       if (entry.bot !== bot) return;
 
-      // ── If non-DonutSMP and a retry is already scheduled, ignore.
       if (e.status === "reconnecting" && !e.isDonutSmp) {
         console.log(`[botmanager] 🟠 Ignoring kicked event for ${minecraftUser} — retry already scheduled`);
         return;
       }
 
-      // ── DonutSMP verification kick — log it and let the end handler
-      //    drive the retry. end always fires after kicked, so we just
-      //    mark kickHandled=true to tell end this was a verification kick
-      //    (not a socketClosed) so it knows to retry regardless of connectedSince.
       if (e.isDonutSmp && isDonutSmpVerificationKick(reasonText)) {
         console.log(`[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} — waiting for end event to schedule retry`);
-        kickHandled = true; // signals end handler: this was a verification kick, proceed with retry
+        kickHandled = true;
         return;
       }
 
-      // ── Auto-version rotation on version mismatch kicks ───────
       if (autoMode && shouldRotateVersionForReason(reasonText)) {
         autoVersionIndex++;
         if (autoVersionIndex < autoCandidates.length) {
@@ -765,16 +698,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
+    // ── Error ────────────────────────────────────────────────────
     bot.on("error", (err) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
-
       const errCode = err.code;
       const errMessage = err.message || "";
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
-      // ── Auth error dedup ───────────────────────────────────
       const isAuthError =
         errMessage.includes("invalid_grant") ||
         errMessage.includes("AADSTS") ||
@@ -788,7 +720,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         }
         handledAuthErrors.add(botId);
         setTimeout(() => handledAuthErrors.delete(botId), AUTH_ERROR_DEDUP_TTL_MS);
-
         clearAuthCache(minecraftUser);
         e.status = "error";
         e.spawnError = "Microsoft authentication failed. Run /mcbot start again to sign in.";
@@ -820,37 +751,26 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
+    // ── End ──────────────────────────────────────────────────────
     bot.on("end", (reason) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
 
-      // Guard: only process end events from the CURRENT bot instance.
-      // On retries, a new bot is created and assigned to entry.bot.
-      // Stale end events from old instances must be ignored.
       if (entry.bot !== bot) return;
 
-      // Allow "reconnecting" through for DonutSMP — each retry spawns a new
-      // mineflayer instance whose end event must be processed to drive the next retry.
-      // For non-DonutSMP, "reconnecting" means a retry is already scheduled — ignore.
       if (e.status !== "online" && e.status !== "connecting" && e.status !== "reconnecting") return;
       if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
-      const reasonStr = String(reason || "").toLowerCase();
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
-      // ── DonutSMP verification screen handling ──────────────
-      // Two cases trigger a retry:
-      //   1. socketClosed (pre or post login) — isDonutSmpVerificationDisconnect
-      //   2. Verification kick — kickHandled flag set by the kicked handler
-      // Only ONE path schedules the retry (end is the single driver).
       const isVerificationEvent =
         (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) ||
         kickHandled;
-      kickHandled = false; // always reset for next bot instance
+      kickHandled = false;
+
       if (isVerificationEvent && e.isDonutSmp) {
         if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
           e.donutSmpVerificationRetries++;
-          // isVerificationEvent captured before kickHandled was reset, so derive phase cleanly
           const phaseLabel = isDonutSmpVerificationDisconnect(reason, e.connectedSince)
             ? (e.connectedSince === null ? "pre-login socketClosed" : "post-login socketClosed")
             : "verification kick";
@@ -859,7 +779,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
             `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
           );
           e.status = "reconnecting";
-          e.spawnError = null; // clear any stale error
+          e.spawnError = null;
           setTimeout(() => {
             if (!activeBots.has(botId)) return;
             try { bot.end(); } catch (_) {}
@@ -867,10 +787,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
           return;
         } else {
-          // Exhausted retries — give up and report a helpful error
-          console.warn(
-            `[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — reporting error to user`
-          );
+          console.warn(`[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — reporting error to user`);
           e.status = "error";
           e.spawnError =
             "DonutSMP is requiring account verification before allowing you to join. " +
@@ -882,7 +799,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         }
       }
 
-      // ── Standard disconnect handling ─────────────────────
       e.status = "error";
       e.spawnError = `Disconnected: ${reason}`;
 
@@ -910,9 +826,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 // STOP / CLEANUP
 // ============================================================
 
-/**
- * Stop a specific bot by discordId + minecraftUser.
- */
 function stopBot(discordId, minecraftUser) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🛑 Stopping bot — discordId: ${discordId}, mc: ${minecraftUser}`);
@@ -931,9 +844,6 @@ function stopBot(discordId, minecraftUser) {
   return { success: true };
 }
 
-/**
- * Stop ALL bots for a given discordId (convenience).
- */
 function stopBotsForUser(discordId) {
   console.log(`[botmanager] 🛑 Stopping all bots for discordId: ${discordId}`);
   const prefix = `${discordId}:`;
@@ -966,8 +876,6 @@ function cleanupBot(botId, reason) {
   }
 
   activeBots.delete(botId);
-
-  // Record for the /ended endpoint (Discord bot polls this for offline DMs)
   recordEndedBot(entry, reason);
 
   try { entry.bot.quit(); } catch (_) {}
@@ -980,9 +888,6 @@ function cleanupBot(botId, reason) {
 // STATUS / LIST
 // ============================================================
 
-/**
- * Get status for a specific (discordId, minecraftUser) bot.
- */
 function getBotStatus(discordId, minecraftUser) {
   const botId = makeBotId(discordId, minecraftUser);
   const entry = activeBots.get(botId);
@@ -1002,15 +907,11 @@ function getBotStatus(discordId, minecraftUser) {
       spawnError: entry.spawnError || null,
       errorCategory: entry.errorCategory || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
-      // DonutSMP-specific info for debugging
       donutSmpVerificationRetries: entry.isDonutSmp ? entry.donutSmpVerificationRetries : undefined,
     },
   };
 }
 
-/**
- * Get statuses for ALL bots belonging to a discordId.
- */
 function getBotsForUser(discordId) {
   const prefix = `${discordId}:`;
   const bots = [];
