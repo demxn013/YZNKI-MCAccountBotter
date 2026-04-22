@@ -439,29 +439,25 @@ function sendClientSettings(bot, username, context) {
 }
 
 // ============================================================
-// DONUTSMP QUIET WINDOW
+// DONUTSMP QUIET WINDOW + BOAR PING/PONG HANDLER
 //
 // ROOT CAUSE: DonutSMP's "Boar" anti-cheat sends a `ping` packet
-// with an i32 id and expects an immediate `pong` echo with the same id.
-// If the response is missing or wrong: "Invalid sequence" kick.
+// (minecraft-protocol packet name: "ping") with an i32 payload id.
+// The client MUST echo it back immediately as a `pong` with the
+// EXACT same id. Any delay, wrong id, or missed echo = "Invalid sequence".
 //
-// CRITICAL: The quiet proxy must ONLY suppress pure movement packets.
-// It must NEVER suppress:
-//   - pong          (response to Boar's ping challenge — dropping = instant kick)
-//   - keep_alive    (handled by minecraft-protocol automatically)
-//   - teleport_confirm (mineflayer responds to position packets from server)
-//   - chunk_batch_received (mineflayer responds to chunk_batch_finished)
+// This is separate from keep_alive. minecraft-protocol / mineflayer do
+// NOT auto-respond to `ping` — it must be handled manually at the
+// _client (raw protocol) level so there is zero buffering delay.
 //
-// The proxy only suppresses outbound movement packets that would cause
-// "Invalid move" errors during chunk loading, while letting all
-// challenge-response traffic flow freely.
+// The quiet proxy suppresses ONLY movement packets during chunk load.
+// pong, keep_alive, teleport_confirm, chunk_batch_received pass freely.
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   const quietEnd = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
 
   entry.donutSmpQuietUntil = quietEnd;
   // Mark when the profile tick may start sending look packets.
-  // quiet window + physics resume delay + small buffer
   entry.donutSmpReadyAt = quietEnd + DONUTSMP_PHYSICS_RESUME_DELAY_MS + 2000;
 
   // Disable mineflayer physics to stop position/look spam at the source.
@@ -470,10 +466,39 @@ function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
     console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled`);
   }
 
+  // ── Boar ping/pong echo ─────────────────────────────────────────────────
+  // Listen at the raw _client level for the lowest possible latency.
+  // Boar sends packet name "ping" (not keep_alive) with an i32 `id` field.
+  // We must write "pong" with the identical `id` immediately.
+  //
+  // We keep a reference to the handler so we can remove it on cleanup
+  // without removing unrelated listeners.
+  function onBoarPing(packet) {
+    try {
+      // packet.id is the i32 challenge value Boar expects echoed back.
+      bot._client.write("pong", { id: packet.id });
+      const debugLevel = String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase();
+      if (debugLevel === "forensic") {
+        console.log(`[botmanager] 🔬 [${minecraftUser}] Boar ping echoed — id=${packet.id}`);
+      }
+    } catch (err) {
+      console.warn(`[botmanager] ⚠️ [${minecraftUser}] Could not send pong for Boar ping:`, err.message);
+    }
+  }
+
+  // minecraft-protocol exposes raw inbound packets via `bot._client.on(packetName, cb)`.
+  // The packet is named "ping" on the play state in 1.17+ protocol.
+  bot._client.on("ping", onBoarPing);
+
+  console.log(`[botmanager] 🟠 [${minecraftUser}] Boar ping/pong echo handler installed`);
+
+  // ── Movement suppression proxy ──────────────────────────────────────────
   const origWrite = bot._client.write.bind(bot._client);
 
   bot._client.write = function donutSmpQuietProxy(name, params) {
-    // ONLY drop movement packets — challenge-response packets must always pass.
+    // ONLY drop movement packets — challenge-response (pong etc.) must pass.
+    // Note: pong is written via origWrite inside onBoarPing, so it bypasses
+    // this proxy entirely and is never accidentally suppressed.
     if (DONUTSMP_QUIET_SUPPRESS.has(name)) {
       return; // drop silently
     }
@@ -515,6 +540,11 @@ function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
   if (quietTimer.unref) quietTimer.unref();
+
+  // Return the ping handler reference so cleanupBot can remove it if needed.
+  // We store it on the entry for access during cleanup.
+  entry._boarPingHandler = onBoarPing;
+  entry._boarPingClient = bot._client;
 }
 
 // ============================================================
@@ -591,6 +621,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     // Timestamp after which DonutSmpProfile.tick() may send look packets.
     // Set by installDonutSmpQuietProxy; 0 = not yet connected (stay quiet).
     donutSmpReadyAt: 0,
+    // Boar ping handler reference for cleanup
+    _boarPingHandler: null,
+    _boarPingClient: null,
   };
 
   activeBots.set(botId, entry);
@@ -619,6 +652,16 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.connectedSince = null;
     entry.donutSmpQuietUntil = 0;
     entry.donutSmpReadyAt = 0;
+
+    // Remove any leftover Boar ping handler from a previous spawn attempt
+    // before creating a new bot, so we don't leak listeners.
+    if (entry._boarPingHandler && entry._boarPingClient) {
+      try {
+        entry._boarPingClient.removeListener("ping", entry._boarPingHandler);
+      } catch (_) {}
+      entry._boarPingHandler = null;
+      entry._boarPingClient = null;
+    }
 
     if (entry.donutSmpVerificationRetries > 0) {
       console.log(
@@ -705,7 +748,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install quiet proxy — suppresses ONLY movement packets.
+        // Install quiet proxy + Boar ping/pong echo handler.
         // pong, keep_alive, teleport_confirm, chunk_batch_received all pass freely.
         installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
 
@@ -957,6 +1000,15 @@ function cleanupBot(botId, reason) {
   if (entry.spawnTimeoutId) {
     clearTimeout(entry.spawnTimeoutId);
     entry.spawnTimeoutId = null;
+  }
+
+  // Remove Boar ping listener to prevent ghost handlers after bot ends.
+  if (entry._boarPingHandler && entry._boarPingClient) {
+    try {
+      entry._boarPingClient.removeListener("ping", entry._boarPingHandler);
+    } catch (_) {}
+    entry._boarPingHandler = null;
+    entry._boarPingClient = null;
   }
 
   activeBots.delete(botId);
