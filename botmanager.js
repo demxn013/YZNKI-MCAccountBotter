@@ -150,55 +150,33 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
-const DONUTSMP_STRICT_VERSION = "1.21.11";
+const DONUTSMP_STRICT_VERSION = "1.21.4";
 
-// How long after login to suppress packets.
-// Increased from 15s → 30s: DonutSMP's chunk loading + sequence
-// checker needs more time to settle before we send anything.
+// How long after login to suppress MOVEMENT packets.
+// Keep_alive, ping/pong, chunk_batch, and teleport_confirm are
+// NEVER suppressed — DonutSMP's Boar anti-cheat sends ping challenges
+// and expects immediate pong responses. Dropping them causes
+// "Invalid sequence" kicks.
 const DONUTSMP_POST_LOGIN_QUIET_MS = 30000;
 
-// Additional delay after quiet window before re-enabling physics.
-// Gives mineflayer's internal state time to sync before it starts
-// emitting position packets, avoiding a burst right at quiet-end.
+// Delay after quiet window before re-enabling physics.
 const DONUTSMP_PHYSICS_RESUME_DELAY_MS = 3000;
-const DONUTSMP_POST_UNMUTE_GRACE_MS = 2000;
 
-// Packets suppressed during the quiet window (dropped entirely).
+// ONLY suppress pure movement/position packets during chunk loading.
+// All challenge-response packets (pong, keep_alive, teleport_confirm,
+// chunk_batch_received) MUST be allowed through at all times.
 const DONUTSMP_QUIET_SUPPRESS = new Set([
   "position",      // player movement
   "look",          // head rotation
   "position_look", // combined move+look
   "flying",        // on-ground packet
-  "settings",      // client settings — can trigger sequence tracking on DonutSMP
+  "settings",      // client settings — can trigger sequence tracking
 ]);
-
-const DONUTSMP_DEBUG_LEVEL = String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase();
-const DONUTSMP_LOG_PACKET_LIMIT = Math.max(5, parseInt(process.env.DONUTSMP_LOG_PACKET_LIMIT || "60", 10));
-
-function donutDebugEnabled(level) {
-  if (DONUTSMP_DEBUG_LEVEL === "forensic") return true;
-  if (DONUTSMP_DEBUG_LEVEL === "detailed") return level !== "forensic";
-  return level === "minimal";
-}
-
-function jitterMs(baseMs, pct = 0.15) {
-  const span = Math.floor(baseMs * pct);
-  return baseMs + Math.floor((Math.random() * ((span * 2) + 1)) - span);
-}
-
-function nowDelta(connectedSince) {
-  if (!connectedSince) return "t+?.???s";
-  return `t+${((Date.now() - connectedSince) / 1000).toFixed(3)}s`;
-}
 
 function isDonutSmpHost(host) {
   if (!host) return false;
   const lower = host.toLowerCase();
-  const matched = DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
-  if (matched && donutDebugEnabled("detailed")) {
-    console.log(`[botmanager] 🧭 Donut host matched: input=${host} normalized=${lower}`);
-  }
-  return matched;
+  return DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
 }
 
 function isDonutSmpVerificationKick(reasonText) {
@@ -228,7 +206,7 @@ const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
 const versionCache = new Map();
 
 const SUPPORTED_VERSIONS = new Set([
-  "1.21.11", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
+  "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
   "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20",
   "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19",
   "1.18.2", "1.18.1", "1.18",
@@ -290,7 +268,7 @@ const BOT_FOOD_ITEMS = new Set([
 // ============================================================
 function getAutoCandidatesForHost(hostLower) {
   return [
-    "1.21.11", "1.21.4", "1.21.1", "1.21",
+    "1.21.4", "1.21.1", "1.21",
     "1.20.6", "1.20.4", "1.20.1",
     "1.19.4", "1.19.2",
     "1.18.2", "1.17.1", "1.16.5",
@@ -442,10 +420,6 @@ function makeBotId(discordId, minecraftUser) {
 // ============================================================
 function sendClientSettings(bot, username, context) {
   const ctx = context || "unknown";
-  if (bot && bot.__donutStrictMode) {
-    console.warn(`[botmanager] 🚫 [${username}] Blocked client settings in Donut strict mode (context: ${ctx})`);
-    return;
-  }
   console.log(`[botmanager] 📋 [${username}] Attempting to send client settings (context: ${ctx})`);
   try {
     bot._client.write("settings", {
@@ -467,35 +441,28 @@ function sendClientSettings(bot, username, context) {
 // ============================================================
 // DONUTSMP QUIET WINDOW
 //
-// ROOT CAUSE: DonutSMP runs a strict packet sequence checker.
-// The quiet window suppresses all packets that affect DonutSMP's
-// sequence counters during and after chunk loading.
+// ROOT CAUSE: DonutSMP's "Boar" anti-cheat sends a `ping` packet
+// with an i32 id and expects an immediate `pong` echo with the same id.
+// If the response is missing or wrong: "Invalid sequence" kick.
 //
-// KEY CHANGES vs previous version:
-//   - Quiet window extended to 30s (was 15s) — chunk loading needs
-//     more time to fully settle before any packets are safe to send.
-//   - "settings" added to suppress list — client settings can
-//     trigger a sequence check on DonutSMP's plugin layer.
-//   - Physics re-enable is deferred by DONUTSMP_PHYSICS_RESUME_DELAY_MS
-//     (3s) after the quiet window ends, preventing an immediate burst
-//     of position packets at the moment the proxy is removed.
-//   - No client settings are sent on DonutSMP at all (ever) — the
-//     server does not require them and they risk triggering the checker.
-//   - DonutSmpProfile.tick() respects entry.donutSmpReadyAt before
-//     sending any look packets, controlled via a timestamp set here.
+// CRITICAL: The quiet proxy must ONLY suppress pure movement packets.
+// It must NEVER suppress:
+//   - pong          (response to Boar's ping challenge — dropping = instant kick)
+//   - keep_alive    (handled by minecraft-protocol automatically)
+//   - teleport_confirm (mineflayer responds to position packets from server)
+//   - chunk_batch_received (mineflayer responds to chunk_batch_finished)
+//
+// The proxy only suppresses outbound movement packets that would cause
+// "Invalid move" errors during chunk loading, while letting all
+// challenge-response traffic flow freely.
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
-  const quietStart = Date.now();
-  const quietEnd = quietStart + DONUTSMP_POST_LOGIN_QUIET_MS;
-  const postUnmuteGraceEnd = quietEnd + DONUTSMP_POST_UNMUTE_GRACE_MS;
-  const resumeDelayMs = jitterMs(DONUTSMP_PHYSICS_RESUME_DELAY_MS);
-  const resumeAt = postUnmuteGraceEnd + resumeDelayMs;
+  const quietEnd = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
 
   entry.donutSmpQuietUntil = quietEnd;
-  entry.donutSmpPostUnmuteGraceUntil = postUnmuteGraceEnd;
-  // Mark when it's truly safe for the profile tick to send look packets.
-  // This is quiet window + post-unmute grace + jittered physics resume + buffer.
-  entry.donutSmpReadyAt = resumeAt + 2000;
+  // Mark when the profile tick may start sending look packets.
+  // quiet window + physics resume delay + small buffer
+  entry.donutSmpReadyAt = quietEnd + DONUTSMP_PHYSICS_RESUME_DELAY_MS + 2000;
 
   // Disable mineflayer physics to stop position/look spam at the source.
   if (bot.physicsEnabled !== undefined) {
@@ -504,99 +471,46 @@ function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   }
 
   const origWrite = bot._client.write.bind(bot._client);
-  let eventSeq = 0;
-  let postUnmuteLogged = 0;
-  const suppressedCounts = Object.create(null);
-  const passedCounts = Object.create(null);
-  const passthroughSampleKeys = new Set([
-    "position", "position_look", "look", "flying", "use_item", "held_item_slot", "settings", "pong",
-  ]);
 
   bot._client.write = function donutSmpQuietProxy(name, params) {
-    const now = Date.now();
-    if (now < quietEnd && DONUTSMP_QUIET_SUPPRESS.has(name)) {
-      suppressedCounts[name] = (suppressedCounts[name] || 0) + 1;
-      if (donutDebugEnabled("forensic")) {
-        console.log(
-          `[botmanager] 🔬 [${minecraftUser}] #${++eventSeq} ${nowDelta(entry.connectedSince)} suppress(${name}) ` +
-          `count=${suppressedCounts[name]}`
-        );
-      }
-      // Drop silently — no queue, no flush.
-      return;
-    }
-    if (now < postUnmuteGraceEnd && DONUTSMP_QUIET_SUPPRESS.has(name)) {
-      suppressedCounts[name] = (suppressedCounts[name] || 0) + 1;
-      if (donutDebugEnabled("detailed")) {
-        console.log(
-          `[botmanager] 🔬 [${minecraftUser}] #${++eventSeq} ${nowDelta(entry.connectedSince)} grace-block(${name}) ` +
-          `count=${suppressedCounts[name]}`
-        );
-      }
-      // Drop silently — no queue, no flush.
-      return;
-    }
-    passedCounts[name] = (passedCounts[name] || 0) + 1;
-    if (
-      donutDebugEnabled("forensic") &&
-      postUnmuteLogged < DONUTSMP_LOG_PACKET_LIMIT &&
-      passthroughSampleKeys.has(name)
-    ) {
-      postUnmuteLogged++;
-      const payload = params && typeof params === "object"
-        ? `keys=[${Object.keys(params).slice(0, 6).join(",")}]`
-        : "keys=[]";
-      console.log(
-        `[botmanager] 🔬 [${minecraftUser}] #${++eventSeq} ${nowDelta(entry.connectedSince)} pass(${name}) ${payload}`
-      );
+    // ONLY drop movement packets — challenge-response packets must always pass.
+    if (DONUTSMP_QUIET_SUPPRESS.has(name)) {
+      return; // drop silently
     }
     return origWrite(name, params);
   };
 
   console.log(
     `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy active — ` +
-    `suppressing [${[...DONUTSMP_QUIET_SUPPRESS].join(", ")}] for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s`
+    `suppressing movement only [${[...DONUTSMP_QUIET_SUPPRESS].join(", ")}] for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s ` +
+    `(pong/keep_alive/teleport_confirm pass freely)`
   );
-  if (donutDebugEnabled("detailed")) {
-    console.log(
-      `[botmanager] 🔬 [${minecraftUser}] quietStart=${quietStart} quietEnd=${quietEnd} ` +
-      `graceEnd=${postUnmuteGraceEnd} physicsResumeAt~${resumeAt} readyAt=${entry.donutSmpReadyAt}`
-    );
-  }
 
   const quietTimer = setTimeout(() => {
-    // Guard: bot may have disconnected during the quiet window.
     if (!activeBots.has(botId)) return;
     if (entry.bot !== bot) return;
 
-    // Restore original write — packets can now flow normally.
+    // Restore original write
     bot._client.write = origWrite;
     entry.donutSmpQuietUntil = 0;
 
-    console.log(`[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed — entering post-unmute grace ${DONUTSMP_POST_UNMUTE_GRACE_MS / 1000}s`);
+    console.log(
+      `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed — ` +
+      `re-enabling physics in ${DONUTSMP_PHYSICS_RESUME_DELAY_MS / 1000}s`
+    );
 
-    // Stagger physics re-enable: give the server a moment after we start
-    // accepting packets before mineflayer's tick loop floods position updates.
+    // Stagger physics re-enable to avoid an immediate burst of position packets
     setTimeout(() => {
       if (!activeBots.has(botId)) return;
       if (entry.bot !== bot) return;
 
       if (bot.physicsEnabled !== undefined) {
         bot.physicsEnabled = true;
-        console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled (delay ${resumeDelayMs}ms)`);
+        console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled — normal operation resumed`);
       }
-
-      console.log(`[botmanager] 🟠 [${minecraftUser}] DonutSMP fully settled — normal operation resumed`);
-      if (donutDebugEnabled("forensic")) {
-        console.log(
-          `[botmanager] 🔬 [${minecraftUser}] suppressSummary=${JSON.stringify(suppressedCounts)} ` +
-          `passSummary=${JSON.stringify(passedCounts)}`
-        );
-      }
-      // NOTE: We intentionally do NOT send client settings on DonutSMP.
-      // The server does not require them and sending them risks triggering
-      // DonutSMP's sequence checker post-quiet-window.
-    }, DONUTSMP_POST_UNMUTE_GRACE_MS + resumeDelayMs);
+      // Never send client settings on DonutSMP — not required and risks
+      // triggering sequence tracking.
+    }, DONUTSMP_PHYSICS_RESUME_DELAY_MS);
 
   }, DONUTSMP_POST_LOGIN_QUIET_MS);
 
@@ -634,12 +548,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const { host, port } = parseServerAddress(serverAddress);
   const hostLower = String(host || "").toLowerCase();
-  const requestedVersion = (version || "auto").trim();
+  const requestedVersion = (version || "1.21.4").trim();
   const autoMode = requestedVersion.toLowerCase() === "auto";
   const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
   const cached = autoMode ? versionCache.get(hostLower) : null;
   let effectiveVersion = autoMode
-    ? (cached || autoCandidates[0] || "1.21.11")
+    ? (cached || autoCandidates[0] || "1.21.4")
     : requestedVersion;
 
   let autoVersionIndex = autoMode
@@ -648,8 +562,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const tokenDir = ensureAccountDir(minecraftUser);
   const isDonutSmp = isDonutSmpHost(hostLower);
-  if (isDonutSmp && effectiveVersion !== DONUTSMP_STRICT_VERSION) {
-    console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
+
+  // DonutSMP requires 1.21.4 — override any other version
+  if (isDonutSmp) {
+    if (effectiveVersion !== DONUTSMP_STRICT_VERSION) {
+      console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
+    }
     effectiveVersion = DONUTSMP_STRICT_VERSION;
   }
 
@@ -670,9 +588,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     donutSmpVerificationRetries: 0,
     connectedSince: null,
     donutSmpQuietUntil: 0,
-    donutSmpPostUnmuteGraceUntil: 0,
     // Timestamp after which DonutSmpProfile.tick() may send look packets.
-    // Set by installDonutSmpQuietProxy; 0 = not yet connected.
+    // Set by installDonutSmpQuietProxy; 0 = not yet connected (stay quiet).
     donutSmpReadyAt: 0,
   };
 
@@ -722,7 +639,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
         checkTimeoutInterval: 30 * 1000,
       });
-      bot.__donutStrictMode = isDonutSmp;
     } catch (err) {
       console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
       entry.status = "error";
@@ -733,23 +649,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
     entry.bot = bot;
     let kickHandled = false;
-    let eventOrder = 0;
-    const logEventOrder = (eventName, extra = "") => {
-      if (!isDonutSmp || !donutDebugEnabled("detailed")) return;
-      console.log(`[botmanager] 🔬 [${minecraftUser}] event#${++eventOrder} ${eventName} ${nowDelta(entry.connectedSince)} status=${entry.status}${extra ? ` ${extra}` : ""}`);
-    };
 
     // ── Hunger ───────────────────────────────────────────────────────────────
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
       // Don't eat during DonutSMP quiet window or before ready
-      if (isDonutSmp && Date.now() < entry.donutSmpReadyAt) {
-        if (donutDebugEnabled("forensic")) {
-          console.log(`[botmanager] 🔬 [${minecraftUser}] eat blocked before readyAt=${entry.donutSmpReadyAt}`);
-        }
-        return;
-      }
+      if (isDonutSmp && Date.now() < entry.donutSmpReadyAt) return;
       if (bot.food >= 18) return;
 
       const foodItem = bot.inventory.items().find(
@@ -790,7 +696,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       e.status = "online";
       e.version = versionToTry;
       e.connectedSince = Date.now();
-      logEventOrder("login", `version=${versionToTry}`);
 
       if (autoMode) {
         versionCache.set(hostLower, versionToTry);
@@ -800,8 +705,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install the quiet proxy — suppresses all sequence-sensitive packets
-        // during chunk loading. Physics re-enable is staggered after proxy removal.
+        // Install quiet proxy — suppresses ONLY movement packets.
+        // pong, keep_alive, teleport_confirm, chunk_batch_received all pass freely.
         installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
 
         console.log(
@@ -825,7 +730,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
-      logEventOrder("spawn");
       if (isDonutSmp) {
         console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet proxy active`);
       }
@@ -835,7 +739,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.on("kicked", (reason) => {
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
-      logEventOrder("kicked", `reason=${reasonText}`);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
 
       const e = activeBots.get(botId);
@@ -886,7 +789,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const e = activeBots.get(botId);
       const errCode = err.code;
       const errMessage = err.message || "";
-      logEventOrder("error", `code=${errCode || "none"}`);
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
@@ -941,7 +843,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       if (entry.bot !== bot) return;
 
-      logEventOrder("end", `reason=${reason}`);
       if (e.status !== "online" && e.status !== "connecting" && e.status !== "reconnecting") return;
       if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
