@@ -109,8 +109,9 @@ const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const DONUTSMP_STRICT_VERSION = "1.21.11";
 
-// How long to keep physics disabled after login.
-const DONUTSMP_QUIET_MS = 30 * 1000;
+// How long to block autonomous position packets after login.
+// Packet log showed kick at ~80s — use 120s to safely outlast the checker.
+const DONUTSMP_QUIET_MS = 120 * 1000;
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -286,48 +287,71 @@ function sendClientSettings(bot, username, context) {
 // ============================================================
 // DONUTSMP QUIET WINDOW
 //
-// "Invalid sequence" root cause (confirmed by source analysis):
-//   When the server sends a forced 'position' packet, mineflayer's
-//   physics plugin immediately responds with 'position_look' (the
-//   teleport echo) AND sets shouldUsePhysics=true. Previous versions
-//   used a write proxy that suppressed position_look — this dropped
-//   the teleport echo, leaving the server's teleport unconfirmed for
-//   30s. When physics resumed and sent new position packets, they were
-//   at coordinates the server didn't expect → "Invalid sequence".
+// "Invalid sequence" root cause (confirmed by packet log analysis):
+//   Even with physicsEnabled=false, mineflayer's physics tick sends
+//   an autonomous `position` heartbeat packet every ~1 second when
+//   shouldUsePhysics=true (which gets set by the forced teleport handler).
+//   DonutSMP's sequence checker counts these and kicks after enough
+//   accumulate (~80s worth = ~80 position packets).
 //
-// CORRECT FIX:
-//   Disable physics only. This stops mineflayer's autonomous movement
-//   tick (the source of spurious position/look spam), while leaving
-//   the 'position' event handler untouched so it can still:
-//     - send teleport_confirm  (required for every server teleport)
-//     - send position_look echo (required response to forced position)
-//     - send keep_alive echo   (handled by mineflayer's keepAlive plugin)
-//     - send chunk_batch_received (handled by mineflayer's blocks plugin)
-//     - send pong              (handled by mineflayer's game plugin)
-//   All of these are mineflayer internal responses — no proxy needed.
+// KEY DISTINCTION between packet types:
+//   - `position`      = autonomous heartbeat from physics tick (BLOCK THIS)
+//   - `position_look` = teleport echo response to server's `position` packet (ALLOW THIS)
+//   - `flying`        = on-ground heartbeat, same issue as position (BLOCK THIS)
+//   - `look`          = head rotation from DonutSmpProfile.tick (BLOCK THIS)
 //
-// After DONUTSMP_QUIET_MS: physics re-enabled (no stagger needed since
-// mineflayer has been tracking position correctly via teleport responses).
+// FIX: targeted write proxy that blocks only the autonomous movement
+//   packets, while allowing all server-response packets through freely.
+//   Physics also disabled to reduce the frequency of these packets and
+//   stop DonutSmpProfile.tick() from sending look packets prematurely.
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   const quietEnd = Date.now() + DONUTSMP_QUIET_MS;
   entry.donutSmpQuietUntil = quietEnd;
-  // DonutSmpProfile.tick() checks this before sending look packets
   entry.donutSmpReadyAt = quietEnd + 3000;
 
+  // Disable physics to stop the physics simulation tick from running.
+  // This reduces movement packets but doesn't eliminate the heartbeat
+  // (mineflayer still sends position every 1s when shouldUsePhysics=true).
   if (bot.physicsEnabled !== undefined) {
     bot.physicsEnabled = false;
-    console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled for ${DONUTSMP_QUIET_MS / 1000}s (teleport/keep_alive/pong responses unaffected)`);
   }
+
+  const origWrite = bot._client.write.bind(bot._client);
+  let suppressed = 0;
+
+  // BLOCK: autonomous outbound movement packets
+  // ALLOW: position_look (teleport echo), keep_alive, pong, teleport_confirm,
+  //        chunk_batch_received, settings, and everything else
+  const BLOCK = new Set(["position", "flying", "look"]);
+
+  bot._client.write = function donutSmpQuietProxy(name, params) {
+    if (BLOCK.has(name)) {
+      suppressed++;
+      return;
+    }
+    return origWrite(name, params);
+  };
+
+  console.log(
+    `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy active — ` +
+    `blocking [position, flying, look] for ${DONUTSMP_QUIET_MS / 1000}s ` +
+    `(position_look/teleport_confirm/pong/keep_alive pass freely)`
+  );
 
   const quietTimer = setTimeout(() => {
     if (!activeBots.has(botId) || entry.bot !== bot) return;
+    bot._client.write = origWrite;
     entry.donutSmpQuietUntil = 0;
 
     if (bot.physicsEnabled !== undefined) {
       bot.physicsEnabled = true;
-      console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled — normal operation resumed`);
     }
+
+    console.log(
+      `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed ` +
+      `(${suppressed} packets suppressed) — normal operation resumed`
+    );
   }, DONUTSMP_QUIET_MS);
 
   if (quietTimer.unref) quietTimer.unref();
@@ -392,8 +416,8 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // Spawn timeout must exceed quiet window (100s) for DonutSMP
-  const initialSpawnTimeoutMs = isDonutSmp ? 150000 : 30000;
+  // Spawn timeout must exceed quiet window (120s) for DonutSMP
+  const initialSpawnTimeoutMs = isDonutSmp ? 180000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
