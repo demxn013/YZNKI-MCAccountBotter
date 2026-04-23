@@ -318,10 +318,20 @@ function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
 
   bot._client.write = function donutSmpMovementBlock(name, params) {
     if (BLOCK.has(name)) {
-      console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED]`, JSON.stringify(params).slice(0, 120));
+      try {
+        const preview = JSON.stringify(params);
+        console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED]`, (preview != null ? preview : "(non-serializable)").slice(0, 120));
+      } catch {
+        console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED] (non-serializable)`);
+      }
       return; // drop silently — AFK bot never needs these
     }
-    console.log(`[donut-pkt] → CLIENT sent: ${name}`, JSON.stringify(params).slice(0, 120));
+    try {
+      const preview = JSON.stringify(params);
+      console.log(`[donut-pkt] → CLIENT sent: ${name}`, (preview != null ? preview : "(non-serializable)").slice(0, 120));
+    } catch {
+      console.log(`[donut-pkt] → CLIENT sent: ${name} (non-serializable)`);
+    }
     return origWrite(name, params);
   };
 
@@ -497,7 +507,13 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     // Keep until explicitly told to remove.
     if (isDonutSmp) {
       bot._client.on("packet", (data, meta) => {
-        console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, JSON.stringify(data).slice(0, 120));
+        try {
+          const serialized = JSON.stringify(data);
+          const preview = (serialized != null) ? serialized.slice(0, 120) : "(non-serializable)";
+          console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, preview);
+        } catch {
+          console.log(`[donut-pkt] ← SERVER sent: ${meta.name} (binary/non-serializable)`);
+        }
       });
     }
 
