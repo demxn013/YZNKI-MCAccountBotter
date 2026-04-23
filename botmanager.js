@@ -98,7 +98,7 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 //   during chunk loading — these arrive before the server has finished
 //   setting up the player's position, causing sequence mismatches.
 //
-// FIX: disable physics for DONUTSMP_QUIET_MS after login.
+// FIX: permanently block autonomous position/flying/look for the session.
 //   - mineflayer's position event handler still responds to forced
 //     server teleports (teleport_confirm + position_look echo)
 //   - keep_alive, chunk_batch_received, pong all handled automatically
@@ -108,10 +108,6 @@ const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const DONUTSMP_STRICT_VERSION = "1.21.11";
-
-// How long to block autonomous position packets after login.
-// Packet log showed kick at ~80s — use 120s to safely outlast the checker.
-const DONUTSMP_QUIET_MS = 120 * 1000;
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -285,76 +281,53 @@ function sendClientSettings(bot, username, context) {
 }
 
 // ============================================================
-// DONUTSMP QUIET WINDOW
+// DONUTSMP MOVEMENT SUPPRESSION
 //
-// "Invalid sequence" root cause (confirmed by packet log analysis):
-//   Even with physicsEnabled=false, mineflayer's physics tick sends
-//   an autonomous `position` heartbeat packet every ~1 second when
-//   shouldUsePhysics=true (which gets set by the forced teleport handler).
-//   DonutSMP's sequence checker counts these and kicks after enough
-//   accumulate (~80s worth = ~80 position packets).
+// "Invalid sequence" root cause (confirmed by packet log):
+//   Mineflayer sends a `position` heartbeat every ~1 second as long as
+//   shouldUsePhysics=true. DonutSMP's sequence checker counts these and
+//   kicks after enough accumulate — at 80s with no suppression, at 216s
+//   with a 120s window. The checker has no time limit; it just counts.
 //
-// KEY DISTINCTION between packet types:
-//   - `position`      = autonomous heartbeat from physics tick (BLOCK THIS)
-//   - `position_look` = teleport echo response to server's `position` packet (ALLOW THIS)
-//   - `flying`        = on-ground heartbeat, same issue as position (BLOCK THIS)
-//   - `look`          = head rotation from DonutSmpProfile.tick (BLOCK THIS)
+// FIX: permanently block autonomous position/flying/look packets for
+//   the entire session. An AFK bot has no reason to send them at all.
+//   - `position`      = autonomous heartbeat (BLOCK FOREVER)
+//   - `flying`        = on-ground heartbeat (BLOCK FOREVER)
+//   - `look`          = head rotation (BLOCK FOREVER)
+//   - `position_look` = teleport echo response (ALWAYS ALLOW)
+//   All other packets (keep_alive, pong, teleport_confirm, etc.) pass freely.
 //
-// FIX: targeted write proxy that blocks only the autonomous movement
-//   packets, while allowing all server-response packets through freely.
-//   Physics also disabled to reduce the frequency of these packets and
-//   stop DonutSmpProfile.tick() from sending look packets prematurely.
+// Physics is also disabled to stop DonutSmpProfile.tick() from sending
+// look packets and to reduce CPU overhead.
 // ============================================================
-function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
-  const quietEnd = Date.now() + DONUTSMP_QUIET_MS;
-  entry.donutSmpQuietUntil = quietEnd;
-  entry.donutSmpReadyAt = quietEnd + 3000;
+function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
+  // donutSmpReadyAt stays 0 — DonutSmpProfile.tick() must never send look
+  // packets on DonutSMP since that would bypass the proxy via the profile.
+  // The profile's tick() checks donutSmpReadyAt before writing look packets,
+  // so leaving it at 0 permanently disables profile-level look sending too.
+  entry.donutSmpReadyAt = 0;
 
-  // Disable physics to stop the physics simulation tick from running.
-  // This reduces movement packets but doesn't eliminate the heartbeat
-  // (mineflayer still sends position every 1s when shouldUsePhysics=true).
   if (bot.physicsEnabled !== undefined) {
     bot.physicsEnabled = false;
   }
 
   const origWrite = bot._client.write.bind(bot._client);
-  let suppressed = 0;
 
-  // BLOCK: autonomous outbound movement packets
-  // ALLOW: position_look (teleport echo), keep_alive, pong, teleport_confirm,
-  //        chunk_batch_received, settings, and everything else
+  // Permanently block autonomous movement packets for this session.
   const BLOCK = new Set(["position", "flying", "look"]);
 
-  bot._client.write = function donutSmpQuietProxy(name, params) {
+  bot._client.write = function donutSmpMovementBlock(name, params) {
     if (BLOCK.has(name)) {
-      suppressed++;
-      return;
+      return; // drop silently — AFK bot never needs these
     }
     return origWrite(name, params);
   };
 
   console.log(
-    `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy active — ` +
-    `blocking [position, flying, look] for ${DONUTSMP_QUIET_MS / 1000}s ` +
+    `[botmanager] 🟠 [${minecraftUser}] DonutSMP movement block installed — ` +
+    `position/flying/look permanently suppressed for session ` +
     `(position_look/teleport_confirm/pong/keep_alive pass freely)`
   );
-
-  const quietTimer = setTimeout(() => {
-    if (!activeBots.has(botId) || entry.bot !== bot) return;
-    bot._client.write = origWrite;
-    entry.donutSmpQuietUntil = 0;
-
-    if (bot.physicsEnabled !== undefined) {
-      bot.physicsEnabled = true;
-    }
-
-    console.log(
-      `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed ` +
-      `(${suppressed} packets suppressed) — normal operation resumed`
-    );
-  }, DONUTSMP_QUIET_MS);
-
-  if (quietTimer.unref) quietTimer.unref();
 }
 
 function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
@@ -416,8 +389,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // Spawn timeout must exceed quiet window (120s) for DonutSMP
-  const initialSpawnTimeoutMs = isDonutSmp ? 180000 : 30000;
+  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
@@ -501,10 +473,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Disable physics for quiet window — stops autonomous movement spam
-        // while mineflayer still handles teleport_confirm/keep_alive/pong internally.
-        installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
-        console.log(`[botmanager] 🟠 DonutSMP login — physics suppression active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
+        // Permanently block autonomous position/flying/look packets.
+        // AFK bot never needs them; position_look teleport echoes still pass.
+        installDonutSmpMovementBlock(bot, e, botId, minecraftUser);
+        console.log(`[botmanager] 🟠 DonutSMP login — movement block active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       } else {
         setTimeout(() => {
           if (!activeBots.has(botId) || entry.bot !== bot) return;
@@ -517,39 +489,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
-    // ── DonutSMP: Inbound packet logger ──────────────────────────────────────
-    // Logs every packet the server sends so we can see what DonutSMP expects.
-    // Only active on DonutSMP. Remove once "Invalid sequence" is resolved.
-    if (isDonutSmp) {
-      const LOGGED_PACKETS = new Set([
-        "keep_alive", "ping", "position", "chunk_batch_start",
-        "chunk_batch_finished", "teleport_confirm", "kick_disconnect",
-        "login", "respawn", "game_state_change", "player_info",
-        "entity_status", "acknowledge_player_digging",
-      ]);
-      bot._client.on("packet", (data, meta) => {
-        if (LOGGED_PACKETS.has(meta.name)) {
-          console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, JSON.stringify(data).slice(0, 120));
-        }
-      });
-      // Also log what WE send back
-      const _origWrite = bot._client.write.bind(bot._client);
-      bot._client.write = function packetLogger(name, params) {
-        const LOGGED_OUTBOUND = new Set([
-          "keep_alive", "pong", "teleport_confirm", "position",
-          "position_look", "look", "flying", "chunk_batch_received", "settings",
-        ]);
-        if (LOGGED_OUTBOUND.has(name)) {
-          console.log(`[donut-pkt] → CLIENT sent: ${name}`, JSON.stringify(params).slice(0, 120));
-        }
-        return _origWrite(name, params);
-      };
-    }
-
     // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
-      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — physics suppressed`);
+      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet proxy active`);
     });
 
     // ── Kicked ───────────────────────────────────────────────────────────────
