@@ -318,8 +318,10 @@ function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
 
   bot._client.write = function donutSmpMovementBlock(name, params) {
     if (BLOCK.has(name)) {
+      console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED]`, JSON.stringify(params).slice(0, 120));
       return; // drop silently — AFK bot never needs these
     }
+    console.log(`[donut-pkt] → CLIENT sent: ${name}`, JSON.stringify(params).slice(0, 120));
     return origWrite(name, params);
   };
 
@@ -488,6 +490,16 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         try { onLinkVerified(discordId, minecraftUser); } catch (_) {}
       }
     });
+
+    // ── DonutSMP: Full packet logger ─────────────────────────────────────────
+    // Logs all inbound packets. Outbound logging is handled inside
+    // installDonutSmpMovementBlock so suppressed packets are also visible.
+    // Keep until explicitly told to remove.
+    if (isDonutSmp) {
+      bot._client.on("packet", (data, meta) => {
+        console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, JSON.stringify(data).slice(0, 120));
+      });
+    }
 
     // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
