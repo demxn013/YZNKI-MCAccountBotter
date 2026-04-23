@@ -94,44 +94,23 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 //
 // "Invalid sequence" root cause:
 //   DonutSMP runs Paper with strict packet sequence validation.
-//   During login/chunk loading the server sends forced-teleport
-//   "position" packets and expects "teleport_confirm" back immediately.
-//   It also sends "chunk_batch_finished" and expects "chunk_batch_received".
-//   Any of these responses being missing or delayed = "Invalid sequence" kick.
+//   Mineflayer's physics tick sends autonomous position/look packets
+//   during chunk loading — these arrive before the server has finished
+//   setting up the player's position, causing sequence mismatches.
 //
-//   Previous versions used a whitelist proxy (only keep_alive passed).
-//   This dropped teleport_confirm, chunk_batch_received, and pong —
-//   all of which Paper requires. Fixed to a blacklist proxy that only
-//   suppresses pure outbound MOVEMENT packets while letting all
-//   challenge-response traffic flow freely.
-//
-// FIX:
-//   1. keepAlive: true (default) — mineflayer handles keep_alive correctly.
-//      No manual echo needed; the builtin handler is fine for Java servers.
-//   2. Blacklist proxy — suppresses only outbound movement packets
-//      (position, look, position_look, flying, settings) for DONUTSMP_QUIET_MS.
-//      teleport_confirm, chunk_batch_received, pong, keep_alive all pass freely.
-//   3. Physics disabled to stop mineflayer's tick from generating movement.
-//   4. After quiet window, proxy removed + physics re-enabled (staggered +3s).
+// FIX: disable physics for DONUTSMP_QUIET_MS after login.
+//   - mineflayer's position event handler still responds to forced
+//     server teleports (teleport_confirm + position_look echo)
+//   - keep_alive, chunk_batch_received, pong all handled automatically
+//   - no write proxy needed — physics=false stops autonomous movement
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const DONUTSMP_STRICT_VERSION = "1.21.11";
 
-// How long to suppress outbound movement packets after login.
+// How long to keep physics disabled after login.
 const DONUTSMP_QUIET_MS = 30 * 1000;
-
-// BLACKLIST — only these outbound packet names are suppressed.
-// Everything else (teleport_confirm, chunk_batch_received, pong,
-// keep_alive, settings acknowledgements) passes freely at all times.
-const DONUTSMP_QUIET_SUPPRESS = new Set([
-  "position",      // player movement
-  "look",          // head rotation
-  "position_look", // combined move+look
-  "flying",        // on-ground status
-  "settings",      // client settings — not required on DonutSMP
-]);
 
 function isDonutSmpHost(host) {
   if (!host) return false;
@@ -305,59 +284,50 @@ function sendClientSettings(bot, username, context) {
 }
 
 // ============================================================
-// DONUTSMP QUIET PROXY
+// DONUTSMP QUIET WINDOW
 //
-// Suppresses only outbound MOVEMENT packets during chunk loading.
-// All challenge-response packets pass freely:
-//   - teleport_confirm  (mineflayer responds to server position packets)
-//   - chunk_batch_received (mineflayer responds to chunk_batch_finished)
-//   - pong              (mineflayer responds to ping)
-//   - keep_alive        (mineflayer's builtin handler responds correctly)
+// "Invalid sequence" root cause (confirmed by source analysis):
+//   When the server sends a forced 'position' packet, mineflayer's
+//   physics plugin immediately responds with 'position_look' (the
+//   teleport echo) AND sets shouldUsePhysics=true. Previous versions
+//   used a write proxy that suppressed position_look — this dropped
+//   the teleport echo, leaving the server's teleport unconfirmed for
+//   30s. When physics resumed and sent new position packets, they were
+//   at coordinates the server didn't expect → "Invalid sequence".
 //
-// Physics is disabled to prevent mineflayer's tick loop from generating
-// movement packets that would be dropped by the proxy anyway.
-// After DONUTSMP_QUIET_MS: proxy removed, physics re-enabled (+3s stagger).
+// CORRECT FIX:
+//   Disable physics only. This stops mineflayer's autonomous movement
+//   tick (the source of spurious position/look spam), while leaving
+//   the 'position' event handler untouched so it can still:
+//     - send teleport_confirm  (required for every server teleport)
+//     - send position_look echo (required response to forced position)
+//     - send keep_alive echo   (handled by mineflayer's keepAlive plugin)
+//     - send chunk_batch_received (handled by mineflayer's blocks plugin)
+//     - send pong              (handled by mineflayer's game plugin)
+//   All of these are mineflayer internal responses — no proxy needed.
+//
+// After DONUTSMP_QUIET_MS: physics re-enabled (no stagger needed since
+// mineflayer has been tracking position correctly via teleport responses).
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
   const quietEnd = Date.now() + DONUTSMP_QUIET_MS;
   entry.donutSmpQuietUntil = quietEnd;
   // DonutSmpProfile.tick() checks this before sending look packets
-  entry.donutSmpReadyAt = quietEnd + 5000;
+  entry.donutSmpReadyAt = quietEnd + 3000;
 
   if (bot.physicsEnabled !== undefined) {
     bot.physicsEnabled = false;
-    console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled for quiet window (${DONUTSMP_QUIET_MS / 1000}s)`);
+    console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled for ${DONUTSMP_QUIET_MS / 1000}s (teleport/keep_alive/pong responses unaffected)`);
   }
-
-  const origWrite = bot._client.write.bind(bot._client);
-  let suppressed = 0;
-
-  bot._client.write = function donutSmpQuietProxy(name, params) {
-    if (DONUTSMP_QUIET_SUPPRESS.has(name)) {
-      suppressed++;
-      return; // drop movement only — all other packets pass freely
-    }
-    return origWrite(name, params);
-  };
-
-  console.log(
-    `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy active — ` +
-    `suppressing [${[...DONUTSMP_QUIET_SUPPRESS].join(", ")}] for ${DONUTSMP_QUIET_MS / 1000}s ` +
-    `(teleport_confirm/chunk_batch_received/pong/keep_alive pass freely)`
-  );
 
   const quietTimer = setTimeout(() => {
     if (!activeBots.has(botId) || entry.bot !== bot) return;
-    bot._client.write = origWrite;
     entry.donutSmpQuietUntil = 0;
-    console.log(`[botmanager] 🟠 [${minecraftUser}] Quiet proxy removed (${suppressed} packets suppressed) — re-enabling physics in 3s`);
-    setTimeout(() => {
-      if (!activeBots.has(botId) || entry.bot !== bot) return;
-      if (bot.physicsEnabled !== undefined) {
-        bot.physicsEnabled = true;
-        console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled — normal operation resumed`);
-      }
-    }, 3000);
+
+    if (bot.physicsEnabled !== undefined) {
+      bot.physicsEnabled = true;
+      console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled — normal operation resumed`);
+    }
   }, DONUTSMP_QUIET_MS);
 
   if (quietTimer.unref) quietTimer.unref();
@@ -507,10 +477,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install blacklist proxy — suppresses only movement packets.
-        // teleport_confirm, chunk_batch_received, pong, keep_alive all pass freely.
+        // Disable physics for quiet window — stops autonomous movement spam
+        // while mineflayer still handles teleport_confirm/keep_alive/pong internally.
         installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
-        console.log(`[botmanager] 🟠 DonutSMP login — quiet proxy active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
+        console.log(`[botmanager] 🟠 DonutSMP login — physics suppression active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       } else {
         setTimeout(() => {
           if (!activeBots.has(botId) || entry.bot !== bot) return;
@@ -523,10 +493,39 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
+    // ── DonutSMP: Inbound packet logger ──────────────────────────────────────
+    // Logs every packet the server sends so we can see what DonutSMP expects.
+    // Only active on DonutSMP. Remove once "Invalid sequence" is resolved.
+    if (isDonutSmp) {
+      const LOGGED_PACKETS = new Set([
+        "keep_alive", "ping", "position", "chunk_batch_start",
+        "chunk_batch_finished", "teleport_confirm", "kick_disconnect",
+        "login", "respawn", "game_state_change", "player_info",
+        "entity_status", "acknowledge_player_digging",
+      ]);
+      bot._client.on("packet", (data, meta) => {
+        if (LOGGED_PACKETS.has(meta.name)) {
+          console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, JSON.stringify(data).slice(0, 120));
+        }
+      });
+      // Also log what WE send back
+      const _origWrite = bot._client.write.bind(bot._client);
+      bot._client.write = function packetLogger(name, params) {
+        const LOGGED_OUTBOUND = new Set([
+          "keep_alive", "pong", "teleport_confirm", "position",
+          "position_look", "look", "flying", "chunk_batch_received", "settings",
+        ]);
+        if (LOGGED_OUTBOUND.has(name)) {
+          console.log(`[donut-pkt] → CLIENT sent: ${name}`, JSON.stringify(params).slice(0, 120));
+        }
+        return _origWrite(name, params);
+      };
+    }
+
     // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
-      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet proxy active`);
+      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — physics suppressed`);
     });
 
     // ── Kicked ───────────────────────────────────────────────────────────────
