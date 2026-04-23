@@ -1,64 +1,36 @@
 // yazanaki/mcbot/botmanager.js (VPS-side)
-// Manages mineflayer bots with Microsoft auth, device-code relay,
-// link verification, version auto-detection, and auth error dedup.
-
 "use strict";
 
 const mineflayer = require("mineflayer");
 const fs = require("fs");
 const path = require("path");
 
-// ============================================================
-// TOKEN CACHE — persists Microsoft tokens between restarts
-// ============================================================
 const TOKENS_ROOT = path.join(__dirname, "tokens");
+if (!fs.existsSync(TOKENS_ROOT)) fs.mkdirSync(TOKENS_ROOT, { recursive: true });
 
-if (!fs.existsSync(TOKENS_ROOT)) {
-  fs.mkdirSync(TOKENS_ROOT, { recursive: true });
-}
-
-function accountTokenDir(username) {
-  return path.join(TOKENS_ROOT, username.toLowerCase());
-}
-
-function markerPath(username) {
-  return path.join(accountTokenDir(username), "_marker.json");
-}
-
+function accountTokenDir(username) { return path.join(TOKENS_ROOT, username.toLowerCase()); }
+function markerPath(username) { return path.join(accountTokenDir(username), "_marker.json"); }
 function ensureAccountDir(username) {
   const dir = accountTokenDir(username);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 function loadToken(username) {
   const dir = accountTokenDir(username);
   if (!fs.existsSync(dir)) return undefined;
-
   try {
     const mp = markerPath(username);
     if (fs.existsSync(mp)) {
       const data = JSON.parse(fs.readFileSync(mp, "utf8"));
-      if (data && typeof data === "object" && data.username) {
-        return data;
-      }
+      if (data && typeof data === "object" && data.username) return data;
     }
-  } catch {
-    // fall through
-  }
-
+  } catch { /* fall through */ }
   try {
     const files = fs.readdirSync(dir);
     const prismarinePattern = /^[a-f0-9]+_(live|xbl|mca|msa|bedrock)-cache\.json$/i;
-    if (files.some(f => prismarinePattern.test(f))) {
-      return true;
-    }
-  } catch {
-    // ignore
-  }
-
+    if (files.some(f => prismarinePattern.test(f))) return true;
+  } catch { /* ignore */ }
   return undefined;
 }
 
@@ -79,52 +51,29 @@ function clearAuthCache(username) {
     console.log(`[botmanager] 🧹 No token directory found for ${username} — nothing to clear`);
     return;
   }
-
   try {
     const files = fs.readdirSync(dir);
     let deleted = 0;
     for (const file of files) {
-      try {
-        fs.unlinkSync(path.join(dir, file));
-        deleted++;
-        console.log(`[botmanager] 🧹 Deleted auth cache file: ${username}/${file}`);
-      } catch (e) {
-        console.warn(`[botmanager] ⚠️ Could not delete ${username}/${file}:`, e.message);
-      }
+      try { fs.unlinkSync(path.join(dir, file)); deleted++; console.log(`[botmanager] 🧹 Deleted auth cache file: ${username}/${file}`); }
+      catch (e) { console.warn(`[botmanager] ⚠️ Could not delete ${username}/${file}:`, e.message); }
     }
-    if (deleted === 0) {
-      console.log(`[botmanager] 🧹 No auth cache files found for ${username}`);
-    }
+    if (deleted === 0) console.log(`[botmanager] 🧹 No auth cache files found for ${username}`);
   } catch (err) {
     console.warn(`[botmanager] ⚠️ Could not scan token directory for ${username}:`, err.message);
   }
 }
 
-// ============================================================
-// IN-MEMORY BOT REGISTRY
-// ============================================================
 const activeBots = new Map();
-
-// ============================================================
-// RECENTLY ENDED BOTS
-// ============================================================
 const recentlyEndedBots = [];
 
 function recordEndedBot(entry, endReason) {
   if (endReason === "manual_stop" || endReason === "stopall" || endReason === "stop_user_all") return;
-
   recentlyEndedBots.push({
-    botId:          entry.botId,
-    discordId:      entry.discordId,
-    minecraftUser:  entry.minecraftUser,
-    serverHost:     entry.serverHost,
-    serverPort:     entry.serverPort,
-    version:        entry.version,
-    endReason,
-    spawnError:     entry.spawnError || null,
-    lastKickReason: entry.lastKickReason || null,
-    errorCategory:  entry.errorCategory || null,
-    endedAt:        new Date().toISOString(),
+    botId: entry.botId, discordId: entry.discordId, minecraftUser: entry.minecraftUser,
+    serverHost: entry.serverHost, serverPort: entry.serverPort, version: entry.version,
+    endReason, spawnError: entry.spawnError || null, lastKickReason: entry.lastKickReason || null,
+    errorCategory: entry.errorCategory || null, endedAt: new Date().toISOString(),
   });
 }
 
@@ -134,43 +83,54 @@ function getAndClearRecentlyEnded() {
   return snapshot;
 }
 
-// ============================================================
-// AUTH ERROR DEDUP GUARD
-// ============================================================
 const handledAuthErrors = new Set();
 const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000;
-
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 
 // ============================================================
 // DONUTSMP SETTINGS
+//
+// "Invalid sequence" root cause:
+//   DonutSMP runs Paper with strict packet sequence validation.
+//   During login/chunk loading the server sends forced-teleport
+//   "position" packets and expects "teleport_confirm" back immediately.
+//   It also sends "chunk_batch_finished" and expects "chunk_batch_received".
+//   Any of these responses being missing or delayed = "Invalid sequence" kick.
+//
+//   Previous versions used a whitelist proxy (only keep_alive passed).
+//   This dropped teleport_confirm, chunk_batch_received, and pong —
+//   all of which Paper requires. Fixed to a blacklist proxy that only
+//   suppresses pure outbound MOVEMENT packets while letting all
+//   challenge-response traffic flow freely.
+//
+// FIX:
+//   1. keepAlive: true (default) — mineflayer handles keep_alive correctly.
+//      No manual echo needed; the builtin handler is fine for Java servers.
+//   2. Blacklist proxy — suppresses only outbound movement packets
+//      (position, look, position_look, flying, settings) for DONUTSMP_QUIET_MS.
+//      teleport_confirm, chunk_batch_received, pong, keep_alive all pass freely.
+//   3. Physics disabled to stop mineflayer's tick from generating movement.
+//   4. After quiet window, proxy removed + physics re-enabled (staggered +3s).
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
-const DONUTSMP_STRICT_VERSION = "1.21.4";
+const DONUTSMP_STRICT_VERSION = "1.21.11";
 
-// How long after login to suppress MOVEMENT packets.
-// Keep_alive, ping/pong, chunk_batch, and teleport_confirm are
-// NEVER suppressed — DonutSMP's Boar anti-cheat sends ping challenges
-// and expects immediate pong responses. Dropping them causes
-// "Invalid sequence" kicks.
-const DONUTSMP_POST_LOGIN_QUIET_MS = 30000;
+// How long to suppress outbound movement packets after login.
+const DONUTSMP_QUIET_MS = 30 * 1000;
 
-// Delay after quiet window before re-enabling physics.
-const DONUTSMP_PHYSICS_RESUME_DELAY_MS = 3000;
-
-// ONLY suppress pure movement/position packets during chunk loading.
-// All challenge-response packets (pong, keep_alive, teleport_confirm,
-// chunk_batch_received) MUST be allowed through at all times.
+// BLACKLIST — only these outbound packet names are suppressed.
+// Everything else (teleport_confirm, chunk_batch_received, pong,
+// keep_alive, settings acknowledgements) passes freely at all times.
 const DONUTSMP_QUIET_SUPPRESS = new Set([
   "position",      // player movement
   "look",          // head rotation
   "position_look", // combined move+look
-  "flying",        // on-ground packet
-  "settings",      // client settings — can trigger sequence tracking
+  "flying",        // on-ground status
+  "settings",      // client settings — not required on DonutSMP
 ]);
 
 function isDonutSmpHost(host) {
@@ -195,22 +155,16 @@ function isDonutSmpVerificationDisconnect(reason, connectedSince) {
   const r = typeof reason === "string" ? reason.toLowerCase() : JSON.stringify(reason).toLowerCase();
   if (!r.includes("socketclosed")) return false;
   if (connectedSince === null) return true;
-  const secondsOnline = Math.floor((Date.now() - connectedSince) / 1000);
-  return secondsOnline < 30;
+  return Math.floor((Date.now() - connectedSince) / 1000) < 30;
 }
 
-// ============================================================
-// VERSION CACHE
-// ============================================================
 const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
 const versionCache = new Map();
-
 const SUPPORTED_VERSIONS = new Set([
-  "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
+  "1.21.11", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
   "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20",
   "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19",
-  "1.18.2", "1.18.1", "1.18",
-  "1.17.1", "1.17",
+  "1.18.2", "1.18.1", "1.18", "1.17.1", "1.17",
   "1.16.5", "1.16.4", "1.16.3", "1.16.2", "1.16.1", "1.16",
   "1.15.2", "1.15.1", "1.15",
   "1.14.4", "1.14.3", "1.14.2", "1.14.1", "1.14",
@@ -223,31 +177,21 @@ const SUPPORTED_VERSIONS = new Set([
 function loadVersionCache() {
   try {
     if (!fs.existsSync(VERSION_CACHE_PATH)) return;
-    const raw = fs.readFileSync(VERSION_CACHE_PATH, "utf8");
-    const json = JSON.parse(raw);
+    const json = JSON.parse(fs.readFileSync(VERSION_CACHE_PATH, "utf8"));
     for (const [host, ver] of Object.entries(json || {})) {
-      if (typeof host === "string" && typeof ver === "string" && SUPPORTED_VERSIONS.has(ver)) {
+      if (typeof host === "string" && typeof ver === "string" && SUPPORTED_VERSIONS.has(ver))
         versionCache.set(host.toLowerCase(), ver);
-      }
     }
-  } catch {
-    // ignore
-  }
+  } catch { /* ignore */ }
 }
 
 function saveVersionCache() {
-  try {
-    fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(Object.fromEntries(versionCache), null, 2), "utf8");
-  } catch {
-    // ignore
-  }
+  try { fs.writeFileSync(VERSION_CACHE_PATH, JSON.stringify(Object.fromEntries(versionCache), null, 2), "utf8"); }
+  catch { /* ignore */ }
 }
 
 loadVersionCache();
 
-// ============================================================
-// HUNGER MANAGEMENT
-// ============================================================
 const BOT_FOOD_ITEMS = new Set([
   "cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton",
   "cooked_rabbit", "cooked_cod", "cooked_salmon",
@@ -257,136 +201,73 @@ const BOT_FOOD_ITEMS = new Set([
   "carrot", "golden_carrot", "melon_slice",
   "baked_potato", "potato", "beetroot",
   "sweet_berries", "glow_berries",
-  "tropical_fish", "dried_kelp",
-  "honey_bottle",
-  "mushroom_stew", "beetroot_soup", "rabbit_stew",
-  "chorus_fruit",
+  "tropical_fish", "dried_kelp", "honey_bottle",
+  "mushroom_stew", "beetroot_soup", "rabbit_stew", "chorus_fruit",
 ]);
 
-// ============================================================
-// VERSION AUTO-DETECTION HELPERS
-// ============================================================
-function getAutoCandidatesForHost(hostLower) {
-  return [
-    "1.21.4", "1.21.1", "1.21",
-    "1.20.6", "1.20.4", "1.20.1",
-    "1.19.4", "1.19.2",
-    "1.18.2", "1.17.1", "1.16.5",
-  ];
+function getAutoCandidatesForHost(_hostLower) {
+  return ["1.21.11","1.21.4","1.21.1","1.21","1.20.6","1.20.4","1.20.1","1.19.4","1.19.2","1.18.2","1.17.1","1.16.5"];
 }
 
 function shouldRotateVersionForReason(reasonText) {
   const t = (reasonText || "").toLowerCase();
-  return (
-    t.includes("outdated") ||
-    t.includes("not supported") ||
-    t.includes("unsupported version") ||
-    t.includes("please update") ||
-    t.includes("wrong version")
-  );
+  return t.includes("outdated") || t.includes("not supported") || t.includes("unsupported version") ||
+         t.includes("please update") || t.includes("wrong version");
 }
 
-// ============================================================
-// SERVER ADDRESS PARSER
-// ============================================================
 function parseServerAddress(serverAddress) {
   const str = String(serverAddress || "").trim();
   const lastColon = str.lastIndexOf(":");
-  if (lastColon === -1) {
-    return { host: str, port: 25565 };
-  }
+  if (lastColon === -1) return { host: str, port: 25565 };
   const possiblePort = parseInt(str.slice(lastColon + 1), 10);
-  if (!isNaN(possiblePort) && possiblePort > 0 && possiblePort <= 65535) {
+  if (!isNaN(possiblePort) && possiblePort > 0 && possiblePort <= 65535)
     return { host: str.slice(0, lastColon), port: possiblePort };
-  }
   return { host: str, port: 25565 };
 }
 
-// ============================================================
-// FATAL ERROR DETECTION
-// ============================================================
 function isFatalNetworkError(errCode, errMessage) {
-  const FATAL_CODES = new Set([
-    "ENOTFOUND", "EAI_AGAIN", "EAI_NONAME",
-    "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH",
-  ]);
+  const FATAL_CODES = new Set(["ENOTFOUND","EAI_AGAIN","EAI_NONAME","ECONNREFUSED","ENETUNREACH","EHOSTUNREACH"]);
   if (errCode && FATAL_CODES.has(errCode)) return true;
   const msg = (errMessage || "").toLowerCase();
-  if (msg.includes("enotfound") || msg.includes("getaddrinfo")) return true;
-  return false;
+  return msg.includes("enotfound") || msg.includes("getaddrinfo");
 }
 
 function getFatalErrorMessage(errCode, errMessage) {
-  if (errCode === "ENOTFOUND" || (errMessage || "").toLowerCase().includes("getaddrinfo")) {
-    return (
-      `The server address could not be resolved (DNS lookup failed for the hostname). ` +
-      `Check that the server address is spelled correctly and is currently online. ` +
-      `Use /mcbot stop and try again with a valid address.`
-    );
-  }
-  if (errCode === "ECONNREFUSED") {
-    return (
-      `The server refused the connection (port is closed or server is offline). ` +
-      `Check that the server is running and the port is correct.`
-    );
-  }
-  if (errCode === "ENETUNREACH" || errCode === "EHOSTUNREACH") {
-    return (
-      `The server is unreachable from this VPS. ` +
-      `The server may be offline or blocking connections from this IP.`
-    );
-  }
+  if (errCode === "ENOTFOUND" || (errMessage || "").toLowerCase().includes("getaddrinfo"))
+    return `The server address could not be resolved (DNS lookup failed). Check that the server address is spelled correctly and is currently online. Use /mcbot stop and try again with a valid address.`;
+  if (errCode === "ECONNREFUSED")
+    return `The server refused the connection (port is closed or server is offline). Check that the server is running and the port is correct.`;
+  if (errCode === "ENETUNREACH" || errCode === "EHOSTUNREACH")
+    return `The server is unreachable from this VPS. The server may be offline or blocking connections from this IP.`;
   return `Network error: ${errMessage || errCode}. The server may be offline or unreachable.`;
 }
 
-// ============================================================
-// DEVICE CODE HANDLER
-// ============================================================
 function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId) {
-  const {
-    user_code: userCode,
-    verification_uri: verificationUri,
-    expires_in: expiresIn,
-  } = deviceCodeResponse;
-
+  const { user_code: userCode, verification_uri: verificationUri, expires_in: expiresIn } = deviceCodeResponse;
   const effectiveExpiresIn = expiresIn || 900;
-
   const entry = botId
     ? activeBots.get(botId)
-    : [...activeBots.values()].find(
-        (e) => e.minecraftUser === minecraftUser && e.status === "connecting",
-      );
+    : [...activeBots.values()].find(e => e.minecraftUser === minecraftUser && e.status === "connecting");
 
   if (entry && entry.deviceCodeEmitted) {
     console.warn(`[botmanager] 🛑 Second device code fired for ${minecraftUser} — killing bot. User must run /mcbot start again.`);
     clearAuthCache(minecraftUser);
-    if (entry.spawnTimeoutId) {
-      clearTimeout(entry.spawnTimeoutId);
-      entry.spawnTimeoutId = null;
-    }
+    if (entry.spawnTimeoutId) { clearTimeout(entry.spawnTimeoutId); entry.spawnTimeoutId = null; }
     entry.status = "error";
-    entry.spawnError =
-      "Microsoft authentication failed — the sign-in session could not be completed. " +
-      "Please run /mcbot start again to receive a fresh login code.";
-    if (botId) {
-      setTimeout(() => cleanupBot(botId, "auth_second_code"), 0);
-    }
+    entry.spawnError = "Microsoft authentication failed — the sign-in session could not be completed. Please run /mcbot start again to receive a fresh login code.";
+    if (botId) setTimeout(() => cleanupBot(botId, "auth_second_code"), 0);
     return;
   }
 
   if (entry) {
     entry.deviceCodeEmitted = true;
-    if (entry.spawnTimeoutId) {
-      clearTimeout(entry.spawnTimeoutId);
-    }
+    if (entry.spawnTimeoutId) clearTimeout(entry.spawnTimeoutId);
     entry.spawnTimeoutId = setTimeout(() => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
       if (e.status !== "connecting") return;
       console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after 300s (auth) — cleaning up`);
-      e.spawnError =
-        "Authentication timed out — the Microsoft device code was not redeemed in time. " +
-        "Run /mcbot start again to get a new code.";
+      e.spawnError = "Authentication timed out — the Microsoft device code was not redeemed in time. Run /mcbot start again to get a new code.";
       e.status = "error";
       setTimeout(() => cleanupBot(botId, "spawn_timeout"), 30000);
     }, 5 * 60 * 1000);
@@ -400,156 +281,88 @@ function handleDeviceCode(minecraftUser, onDeviceCode, deviceCodeResponse, botId
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   if (typeof onDeviceCode === "function") {
-    try {
-      onDeviceCode(userCode, verificationUri, effectiveExpiresIn);
-    } catch (err) {
-      console.warn(`[botmanager] ⚠️ onDeviceCode callback threw:`, err.message);
-    }
+    try { onDeviceCode(userCode, verificationUri, effectiveExpiresIn); }
+    catch (err) { console.warn(`[botmanager] ⚠️ onDeviceCode callback threw:`, err.message); }
   }
 }
 
-// ============================================================
-// BOT ID HELPER
-// ============================================================
 function makeBotId(discordId, minecraftUser) {
   return `${discordId}:${minecraftUser.toLowerCase()}`;
 }
 
-// ============================================================
-// CLIENT SETTINGS SENDER (non-DonutSMP only)
-// ============================================================
 function sendClientSettings(bot, username, context) {
   const ctx = context || "unknown";
-  console.log(`[botmanager] 📋 [${username}] Attempting to send client settings (context: ${ctx})`);
+  console.log(`[botmanager] 📋 [${username}] Sending client settings (context: ${ctx})`);
   try {
     bot._client.write("settings", {
-      locale: "en_US",
-      viewDistance: 8,
-      chatFlags: 0,
-      chatColors: true,
-      skinParts: 127,
-      mainHand: 1,
-      enableTextFiltering: false,
-      enableServerListing: true,
+      locale: "en_US", viewDistance: 8, chatFlags: 0, chatColors: true,
+      skinParts: 127, mainHand: 1, enableTextFiltering: false, enableServerListing: true,
     });
-    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully (context: ${ctx})`);
+    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully`);
   } catch (err) {
     console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings:`, err.message);
   }
 }
 
 // ============================================================
-// DONUTSMP QUIET WINDOW + BOAR PING/PONG HANDLER
+// DONUTSMP QUIET PROXY
 //
-// ROOT CAUSE: DonutSMP's "Boar" anti-cheat sends a `ping` packet
-// (minecraft-protocol packet name: "ping") with an i32 payload id.
-// The client MUST echo it back immediately as a `pong` with the
-// EXACT same id. Any delay, wrong id, or missed echo = "Invalid sequence".
+// Suppresses only outbound MOVEMENT packets during chunk loading.
+// All challenge-response packets pass freely:
+//   - teleport_confirm  (mineflayer responds to server position packets)
+//   - chunk_batch_received (mineflayer responds to chunk_batch_finished)
+//   - pong              (mineflayer responds to ping)
+//   - keep_alive        (mineflayer's builtin handler responds correctly)
 //
-// This is separate from keep_alive. minecraft-protocol / mineflayer do
-// NOT auto-respond to `ping` — it must be handled manually at the
-// _client (raw protocol) level so there is zero buffering delay.
-//
-// The quiet proxy suppresses ONLY movement packets during chunk load.
-// pong, keep_alive, teleport_confirm, chunk_batch_received pass freely.
+// Physics is disabled to prevent mineflayer's tick loop from generating
+// movement packets that would be dropped by the proxy anyway.
+// After DONUTSMP_QUIET_MS: proxy removed, physics re-enabled (+3s stagger).
 // ============================================================
 function installDonutSmpQuietProxy(bot, entry, botId, minecraftUser) {
-  const quietEnd = Date.now() + DONUTSMP_POST_LOGIN_QUIET_MS;
-
+  const quietEnd = Date.now() + DONUTSMP_QUIET_MS;
   entry.donutSmpQuietUntil = quietEnd;
-  // Mark when the profile tick may start sending look packets.
-  entry.donutSmpReadyAt = quietEnd + DONUTSMP_PHYSICS_RESUME_DELAY_MS + 2000;
+  // DonutSmpProfile.tick() checks this before sending look packets
+  entry.donutSmpReadyAt = quietEnd + 5000;
 
-  // Disable mineflayer physics to stop position/look spam at the source.
   if (bot.physicsEnabled !== undefined) {
     bot.physicsEnabled = false;
-    console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled`);
+    console.log(`[botmanager] 🟠 [${minecraftUser}] Physics disabled for quiet window (${DONUTSMP_QUIET_MS / 1000}s)`);
   }
 
-  // ── Boar ping/pong echo ─────────────────────────────────────────────────
-  // Listen at the raw _client level for the lowest possible latency.
-  // Boar sends packet name "ping" (not keep_alive) with an i32 `id` field.
-  // We must write "pong" with the identical `id` immediately.
-  //
-  // We keep a reference to the handler so we can remove it on cleanup
-  // without removing unrelated listeners.
-  function onBoarPing(packet) {
-    try {
-      // packet.id is the i32 challenge value Boar expects echoed back.
-      bot._client.write("pong", { id: packet.id });
-      const debugLevel = String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase();
-      if (debugLevel === "forensic") {
-        console.log(`[botmanager] 🔬 [${minecraftUser}] Boar ping echoed — id=${packet.id}`);
-      }
-    } catch (err) {
-      console.warn(`[botmanager] ⚠️ [${minecraftUser}] Could not send pong for Boar ping:`, err.message);
-    }
-  }
-
-  // minecraft-protocol exposes raw inbound packets via `bot._client.on(packetName, cb)`.
-  // The packet is named "ping" on the play state in 1.17+ protocol.
-  bot._client.on("ping", onBoarPing);
-
-  console.log(`[botmanager] 🟠 [${minecraftUser}] Boar ping/pong echo handler installed`);
-
-  // ── Movement suppression proxy ──────────────────────────────────────────
   const origWrite = bot._client.write.bind(bot._client);
+  let suppressed = 0;
 
   bot._client.write = function donutSmpQuietProxy(name, params) {
-    // ONLY drop movement packets — challenge-response (pong etc.) must pass.
-    // Note: pong is written via origWrite inside onBoarPing, so it bypasses
-    // this proxy entirely and is never accidentally suppressed.
     if (DONUTSMP_QUIET_SUPPRESS.has(name)) {
-      return; // drop silently
+      suppressed++;
+      return; // drop movement only — all other packets pass freely
     }
     return origWrite(name, params);
   };
 
   console.log(
     `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy active — ` +
-    `suppressing movement only [${[...DONUTSMP_QUIET_SUPPRESS].join(", ")}] for ${DONUTSMP_POST_LOGIN_QUIET_MS / 1000}s ` +
-    `(pong/keep_alive/teleport_confirm pass freely)`
+    `suppressing [${[...DONUTSMP_QUIET_SUPPRESS].join(", ")}] for ${DONUTSMP_QUIET_MS / 1000}s ` +
+    `(teleport_confirm/chunk_batch_received/pong/keep_alive pass freely)`
   );
 
   const quietTimer = setTimeout(() => {
-    if (!activeBots.has(botId)) return;
-    if (entry.bot !== bot) return;
-
-    // Restore original write
+    if (!activeBots.has(botId) || entry.bot !== bot) return;
     bot._client.write = origWrite;
     entry.donutSmpQuietUntil = 0;
-
-    console.log(
-      `[botmanager] 🟠 [${minecraftUser}] DonutSMP quiet proxy removed — ` +
-      `re-enabling physics in ${DONUTSMP_PHYSICS_RESUME_DELAY_MS / 1000}s`
-    );
-
-    // Stagger physics re-enable to avoid an immediate burst of position packets
+    console.log(`[botmanager] 🟠 [${minecraftUser}] Quiet proxy removed (${suppressed} packets suppressed) — re-enabling physics in 3s`);
     setTimeout(() => {
-      if (!activeBots.has(botId)) return;
-      if (entry.bot !== bot) return;
-
+      if (!activeBots.has(botId) || entry.bot !== bot) return;
       if (bot.physicsEnabled !== undefined) {
         bot.physicsEnabled = true;
         console.log(`[botmanager] 🟠 [${minecraftUser}] Physics re-enabled — normal operation resumed`);
       }
-      // Never send client settings on DonutSMP — not required and risks
-      // triggering sequence tracking.
-    }, DONUTSMP_PHYSICS_RESUME_DELAY_MS);
-
-  }, DONUTSMP_POST_LOGIN_QUIET_MS);
+    }, 3000);
+  }, DONUTSMP_QUIET_MS);
 
   if (quietTimer.unref) quietTimer.unref();
-
-  // Return the ping handler reference so cleanupBot can remove it if needed.
-  // We store it on the entry for access during cleanup.
-  entry._boarPingHandler = onBoarPing;
-  entry._boarPingClient = bot._client;
 }
 
-// ============================================================
-// START BOT
-// ============================================================
 function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
@@ -560,7 +373,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   console.log(`  Auth mode:    microsoft`);
 
   const botId = makeBotId(discordId, minecraftUser);
-
   handledAuthErrors.delete(botId);
 
   if (activeBots.has(botId)) {
@@ -578,52 +390,31 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const { host, port } = parseServerAddress(serverAddress);
   const hostLower = String(host || "").toLowerCase();
-  const requestedVersion = (version || "1.21.4").trim();
+  const requestedVersion = (version || "1.21.11").trim();
   const autoMode = requestedVersion.toLowerCase() === "auto";
   const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
   const cached = autoMode ? versionCache.get(hostLower) : null;
-  let effectiveVersion = autoMode
-    ? (cached || autoCandidates[0] || "1.21.4")
-    : requestedVersion;
-
-  let autoVersionIndex = autoMode
-    ? Math.max(0, autoCandidates.indexOf(effectiveVersion))
-    : -1;
+  let effectiveVersion = autoMode ? (cached || autoCandidates[0] || "1.21.11") : requestedVersion;
+  let autoVersionIndex = autoMode ? Math.max(0, autoCandidates.indexOf(effectiveVersion)) : -1;
 
   const tokenDir = ensureAccountDir(minecraftUser);
   const isDonutSmp = isDonutSmpHost(hostLower);
 
-  // DonutSMP requires 1.21.4 — override any other version
-  if (isDonutSmp) {
-    if (effectiveVersion !== DONUTSMP_STRICT_VERSION) {
-      console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
-    }
+  if (isDonutSmp && effectiveVersion !== DONUTSMP_STRICT_VERSION) {
+    console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
     effectiveVersion = DONUTSMP_STRICT_VERSION;
   }
 
   const entry = {
-    botId,
-    discordId,
-    minecraftUser,
-    serverHost: host,
-    serverPort: port,
-    version: effectiveVersion,
+    botId, discordId, minecraftUser,
+    serverHost: host, serverPort: port, version: effectiveVersion,
     startedAt: new Date().toISOString(),
-    status: "connecting",
-    spawnError: null,
-    spawnTimeoutId: null,
-    deviceCodeEmitted: false,
-    bot: null,
-    isDonutSmp,
-    donutSmpVerificationRetries: 0,
-    connectedSince: null,
+    status: "connecting", spawnError: null, spawnTimeoutId: null,
+    deviceCodeEmitted: false, bot: null, isDonutSmp,
+    donutSmpVerificationRetries: 0, connectedSince: null,
     donutSmpQuietUntil: 0,
-    // Timestamp after which DonutSmpProfile.tick() may send look packets.
-    // Set by installDonutSmpQuietProxy; 0 = not yet connected (stay quiet).
+    // Timestamp after which DonutSmpProfile.tick() may send look packets
     donutSmpReadyAt: 0,
-    // Boar ping handler reference for cleanup
-    _boarPingHandler: null,
-    _boarPingClient: null,
   };
 
   activeBots.set(botId, entry);
@@ -631,16 +422,17 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
+  // Spawn timeout must exceed quiet window (100s) for DonutSMP
+  const initialSpawnTimeoutMs = isDonutSmp ? 150000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
     const e = activeBots.get(botId);
     if (e.status !== "connecting" && e.status !== "reconnecting") return;
     if (e.deviceCodeEmitted) return;
-    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s (${e.donutSmpVerificationRetries} retries attempted) — giving up`);
+    console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s (${e.donutSmpVerificationRetries} retries) — giving up`);
     e.spawnError = isDonutSmp
-      ? "DonutSMP security check timed out — the verification was not completed in time. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
+      ? "DonutSMP security check timed out. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
       : "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
     e.status = "error";
     if (isDonutSmp) e.errorCategory = "donutsmp_verification";
@@ -653,28 +445,14 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     entry.donutSmpQuietUntil = 0;
     entry.donutSmpReadyAt = 0;
 
-    // Remove any leftover Boar ping handler from a previous spawn attempt
-    // before creating a new bot, so we don't leak listeners.
-    if (entry._boarPingHandler && entry._boarPingClient) {
-      try {
-        entry._boarPingClient.removeListener("ping", entry._boarPingHandler);
-      } catch (_) {}
-      entry._boarPingHandler = null;
-      entry._boarPingClient = null;
-    }
-
     if (entry.donutSmpVerificationRetries > 0) {
-      console.log(
-        `[botmanager] 🟠 DonutSMP retry attempt ${entry.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES} ` +
-        `for ${minecraftUser} — connecting to ${host}:${port}...`
-      );
+      console.log(`[botmanager] 🟠 DonutSMP retry attempt ${entry.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES} for ${minecraftUser} — connecting to ${host}:${port}...`);
     }
 
     let bot;
     try {
       bot = mineflayer.createBot({
-        host,
-        port,
+        host, port,
         username: minecraftUser,
         version: versionToTry,
         auth: "microsoft",
@@ -697,33 +475,20 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!activeBots.has(botId)) return;
-      // Don't eat during DonutSMP quiet window or before ready
       if (isDonutSmp && Date.now() < entry.donutSmpReadyAt) return;
       if (bot.food >= 18) return;
-
-      const foodItem = bot.inventory.items().find(
-        (item) => item && BOT_FOOD_ITEMS.has(item.name)
-      );
+      const foodItem = bot.inventory.items().find(item => item && BOT_FOOD_ITEMS.has(item.name));
       if (!foodItem) return;
-
       isEating = true;
       try {
         await bot.equip(foodItem, "hand");
         await bot.consume();
         eatCooldownUntil = Date.now() + 1500;
         console.log(`[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} (food: ${bot.food}/20)`);
-      } catch {
-        // Ignore eating errors
-      } finally {
-        isEating = false;
-      }
+      } catch { /* ignore */ } finally { isEating = false; }
     }
 
-    bot.on("health", () => {
-      if (bot.food < 18) {
-        tryEat().catch(() => {});
-      }
-    });
+    bot.on("health", () => { if (bot.food < 18) tryEat().catch(() => {}); });
 
     // ── Login ─────────────────────────────────────────────────────────────────
     bot.once("login", () => {
@@ -731,36 +496,24 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       console.log(`[botmanager] ✅ Bot logged in: ${minecraftUser} on ${host}:${port} (${versionToTry})`);
       const e = activeBots.get(botId);
 
-      if (e.spawnTimeoutId) {
-        clearTimeout(e.spawnTimeoutId);
-        e.spawnTimeoutId = null;
-      }
+      if (e.spawnTimeoutId) { clearTimeout(e.spawnTimeoutId); e.spawnTimeoutId = null; }
 
       e.status = "online";
       e.version = versionToTry;
       e.connectedSince = Date.now();
 
-      if (autoMode) {
-        versionCache.set(hostLower, versionToTry);
-        saveVersionCache();
-      }
+      if (autoMode) { versionCache.set(hostLower, versionToTry); saveVersionCache(); }
 
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install quiet proxy + Boar ping/pong echo handler.
-        // pong, keep_alive, teleport_confirm, chunk_batch_received all pass freely.
+        // Install blacklist proxy — suppresses only movement packets.
+        // teleport_confirm, chunk_batch_received, pong, keep_alive all pass freely.
         installDonutSmpQuietProxy(bot, e, botId, minecraftUser);
-
-        console.log(
-          `[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect ` +
-          `(retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`
-        );
+        console.log(`[botmanager] 🟠 DonutSMP login — quiet proxy active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       } else {
-        // Non-DonutSMP: send client settings 1s after login.
         setTimeout(() => {
-          if (!activeBots.has(botId)) return;
-          if (entry.bot !== bot) return;
+          if (!activeBots.has(botId) || entry.bot !== bot) return;
           sendClientSettings(bot, minecraftUser, "post-login");
         }, 1000);
       }
@@ -773,9 +526,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     // ── Spawn ─────────────────────────────────────────────────────────────────
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
-      if (isDonutSmp) {
-        console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet proxy active`);
-      }
+      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — quiet proxy active`);
     });
 
     // ── Kicked ───────────────────────────────────────────────────────────────
@@ -783,18 +534,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (!activeBots.has(botId)) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
-
       const e = activeBots.get(botId);
-
       if (entry.bot !== bot) return;
-
-      if (e.status === "reconnecting" && !e.isDonutSmp) {
-        console.log(`[botmanager] 🟠 Ignoring kicked event for ${minecraftUser} — retry already scheduled`);
-        return;
-      }
+      if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
       if (e.isDonutSmp && isDonutSmpVerificationKick(reasonText)) {
-        console.log(`[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} — waiting for end event to schedule retry`);
+        console.log(`[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} — scheduling retry`);
         kickHandled = true;
         return;
       }
@@ -832,20 +577,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const e = activeBots.get(botId);
       const errCode = err.code;
       const errMessage = err.message || "";
-
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
-      const isAuthError =
-        errMessage.includes("invalid_grant") ||
-        errMessage.includes("AADSTS") ||
-        errMessage.includes("authentication") ||
-        errMessage.toLowerCase().includes("token");
-
+      const isAuthError = errMessage.includes("invalid_grant") || errMessage.includes("AADSTS") ||
+                          errMessage.includes("authentication") || errMessage.toLowerCase().includes("token");
       if (isAuthError) {
-        if (handledAuthErrors.has(botId)) {
-          console.warn(`[botmanager] 🔇 Suppressing duplicate auth error for ${minecraftUser}`);
-          return;
-        }
+        if (handledAuthErrors.has(botId)) { console.warn(`[botmanager] 🔇 Suppressing duplicate auth error for ${minecraftUser}`); return; }
         handledAuthErrors.add(botId);
         setTimeout(() => handledAuthErrors.delete(botId), AUTH_ERROR_DEDUP_TTL_MS);
         clearAuthCache(minecraftUser);
@@ -883,17 +620,14 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.on("end", (reason) => {
       if (!activeBots.has(botId)) return;
       const e = activeBots.get(botId);
-
       if (entry.bot !== bot) return;
-
       if (e.status !== "online" && e.status !== "connecting" && e.status !== "reconnecting") return;
       if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
       const isVerificationEvent =
-        (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) ||
-        kickHandled;
+        (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) || kickHandled;
       kickHandled = false;
 
       if (isVerificationEvent && e.isDonutSmp) {
@@ -902,10 +636,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           const phaseLabel = isDonutSmpVerificationDisconnect(reason, e.connectedSince)
             ? (e.connectedSince === null ? "pre-login socketClosed" : "post-login socketClosed")
             : "verification kick";
-          console.log(
-            `[botmanager] 🟠 DonutSMP ${phaseLabel} for ${minecraftUser} ` +
-            `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
-          );
+          console.log(`[botmanager] 🟠 DonutSMP ${phaseLabel} for ${minecraftUser} (attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`);
           e.status = "reconnecting";
           e.spawnError = null;
           setTimeout(() => {
@@ -915,12 +646,9 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
           }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
           return;
         } else {
-          console.warn(`[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — reporting error to user`);
+          console.warn(`[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser}`);
           e.status = "error";
-          e.spawnError =
-            "DonutSMP is requiring account verification before allowing you to join. " +
-            "Please log into DonutSMP manually once to complete the verification process, " +
-            "then try /mcbot start again.";
+          e.spawnError = "DonutSMP is requiring account verification before allowing you to join. Please log into DonutSMP manually once to complete the verification process, then try /mcbot start again.";
           e.errorCategory = "donutsmp_verification";
           cleanupBot(botId, "donutsmp_verification_failed");
           return;
@@ -932,10 +660,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       if (AUTO_RECONNECT) {
         e.status = "reconnecting";
-        setTimeout(() => {
-          if (!activeBots.has(botId)) return;
-          spawnBot(e.version);
-        }, RECONNECT_DELAY_MS);
+        setTimeout(() => { if (!activeBots.has(botId)) return; spawnBot(e.version); }, RECONNECT_DELAY_MS);
       } else {
         cleanupBot(botId, "end");
       }
@@ -946,17 +671,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   console.log(`[botmanager] 🚀 Bot spawned for ${minecraftUser} (botId: ${botId})`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-
   return { success: true, botId };
 }
 
-// ============================================================
-// STOP / CLEANUP
-// ============================================================
 function stopBot(discordId, minecraftUser) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🛑 Stopping bot — discordId: ${discordId}, mc: ${minecraftUser}`);
-
   const botId = makeBotId(discordId, minecraftUser);
   const entry = activeBots.get(botId);
   if (!entry) {
@@ -964,7 +684,6 @@ function stopBot(discordId, minecraftUser) {
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "no_bot_running" };
   }
-
   cleanupBot(botId, "manual_stop");
   console.log(`[botmanager] ✅ Bot stopped for ${minecraftUser}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -976,10 +695,7 @@ function stopBotsForUser(discordId) {
   const prefix = `${discordId}:`;
   let count = 0;
   for (const botId of [...activeBots.keys()]) {
-    if (botId.startsWith(prefix)) {
-      cleanupBot(botId, "stop_user_all");
-      count++;
-    }
+    if (botId.startsWith(prefix)) { cleanupBot(botId, "stop_user_all"); count++; }
   }
   return { success: true, stopped: count };
 }
@@ -987,60 +703,32 @@ function stopBotsForUser(discordId) {
 function stopAllBots() {
   const count = activeBots.size;
   console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
-  for (const botId of [...activeBots.keys()]) {
-    cleanupBot(botId, "stopall");
-  }
+  for (const botId of [...activeBots.keys()]) cleanupBot(botId, "stopall");
   return { success: true, stopped: count };
 }
 
 function cleanupBot(botId, reason) {
   const entry = activeBots.get(botId);
   if (!entry) return;
-
-  if (entry.spawnTimeoutId) {
-    clearTimeout(entry.spawnTimeoutId);
-    entry.spawnTimeoutId = null;
-  }
-
-  // Remove Boar ping listener to prevent ghost handlers after bot ends.
-  if (entry._boarPingHandler && entry._boarPingClient) {
-    try {
-      entry._boarPingClient.removeListener("ping", entry._boarPingHandler);
-    } catch (_) {}
-    entry._boarPingHandler = null;
-    entry._boarPingClient = null;
-  }
-
+  if (entry.spawnTimeoutId) { clearTimeout(entry.spawnTimeoutId); entry.spawnTimeoutId = null; }
   activeBots.delete(botId);
   recordEndedBot(entry, reason);
-
   try { entry.bot.quit(); } catch (_) {}
   try { entry.bot.end(); } catch (_) {}
-
   console.log(`[botmanager] 🧹 Cleaned up bot for ${entry.minecraftUser} (reason: ${reason})`);
 }
 
-// ============================================================
-// STATUS / LIST
-// ============================================================
 function getBotStatus(discordId, minecraftUser) {
   const botId = makeBotId(discordId, minecraftUser);
   const entry = activeBots.get(botId);
   if (!entry) return { found: false };
-
   return {
     found: true,
     bot: {
-      botId: entry.botId,
-      discordId: entry.discordId,
-      minecraftUser: entry.minecraftUser,
-      serverHost: entry.serverHost,
-      serverPort: entry.serverPort,
-      version: entry.version,
-      startedAt: entry.startedAt,
-      status: entry.status,
-      spawnError: entry.spawnError || null,
-      errorCategory: entry.errorCategory || null,
+      botId: entry.botId, discordId: entry.discordId, minecraftUser: entry.minecraftUser,
+      serverHost: entry.serverHost, serverPort: entry.serverPort, version: entry.version,
+      startedAt: entry.startedAt, status: entry.status,
+      spawnError: entry.spawnError || null, errorCategory: entry.errorCategory || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       donutSmpVerificationRetries: entry.isDonutSmp ? entry.donutSmpVerificationRetries : undefined,
     },
@@ -1053,16 +741,10 @@ function getBotsForUser(discordId) {
   for (const [botId, entry] of activeBots.entries()) {
     if (botId.startsWith(prefix)) {
       bots.push({
-        botId: entry.botId,
-        discordId: entry.discordId,
-        minecraftUser: entry.minecraftUser,
-        serverHost: entry.serverHost,
-        serverPort: entry.serverPort,
-        version: entry.version,
-        startedAt: entry.startedAt,
-        status: entry.status,
-        spawnError: entry.spawnError || null,
-        errorCategory: entry.errorCategory || null,
+        botId: entry.botId, discordId: entry.discordId, minecraftUser: entry.minecraftUser,
+        serverHost: entry.serverHost, serverPort: entry.serverPort, version: entry.version,
+        startedAt: entry.startedAt, status: entry.status,
+        spawnError: entry.spawnError || null, errorCategory: entry.errorCategory || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       });
     }
@@ -1070,33 +752,18 @@ function getBotsForUser(discordId) {
   return bots;
 }
 
-function getBotCount() {
-  return activeBots.size;
-}
+function getBotCount() { return activeBots.size; }
 
 function listAllBots() {
-  return [...activeBots.values()].map((entry) => ({
-    botId: entry.botId,
-    discordId: entry.discordId,
-    minecraftUser: entry.minecraftUser,
-    serverHost: entry.serverHost,
-    serverPort: entry.serverPort,
-    version: entry.version,
-    startedAt: entry.startedAt,
-    status: entry.status,
+  return [...activeBots.values()].map(entry => ({
+    botId: entry.botId, discordId: entry.discordId, minecraftUser: entry.minecraftUser,
+    serverHost: entry.serverHost, serverPort: entry.serverPort, version: entry.version,
+    startedAt: entry.startedAt, status: entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
   }));
 }
 
 module.exports = {
-  makeBotId,
-  startBot,
-  stopBot,
-  stopBotsForUser,
-  stopAllBots,
-  getBotStatus,
-  getBotsForUser,
-  listAllBots,
-  getBotCount,
-  getAndClearRecentlyEnded,
+  makeBotId, startBot, stopBot, stopBotsForUser, stopAllBots,
+  getBotStatus, getBotsForUser, listAllBots, getBotCount, getAndClearRecentlyEnded,
 };
