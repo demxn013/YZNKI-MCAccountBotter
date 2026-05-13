@@ -30,6 +30,7 @@ const {
   getBotsForUser,
   listAllBots,
   getBotCount,
+  getAndClearRecentlyEnded,
 } = require("./botmanager");
 
 const app = express();
@@ -54,12 +55,6 @@ if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM
 // ============================================================
 // PENDING DEVICE CODES
 // Map<botId, { userCode, verificationUri, expiresAt }>
-//
-// botId = `${discordId}:${minecraftUser.toLowerCase()}`
-//
-// Always stores the LATEST code — if prismarine-auth's retry loop
-// generates a new code after the first one, we overwrite so the
-// Discord bot picks up the fresh code on its next poll.
 // ============================================================
 const pendingDeviceCodes = new Map();
 
@@ -128,13 +123,7 @@ app.post("/start", (req, res) => {
     pendingDeviceCodes.delete(botId);
   }
 
-  // Device code callback.
-  //
-  // IMPORTANT: We always overwrite with the latest code. prismarine-auth's
-  // retry loop may generate multiple codes when a cached refresh token is
-  // expired. The Discord bot needs to show the LATEST valid code — the earlier
-  // codes will have been consumed/invalidated by Microsoft by the time the
-  // user tries to enter them.
+  // Device code callback — always overwrite with the latest code.
   const onDeviceCode = (userCode, verificationUri, expiresIn) => {
     const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
     const effectiveExpiresIn = Math.min(
@@ -332,6 +321,23 @@ app.post("/stopall", (req, res) => {
   pendingDeviceCodes.clear();
   const result = stopAllBots();
   return res.status(200).json({ ok: true, message: "All bots stopped", ...result });
+});
+
+// ============================================================
+// ROUTE: Get recently ended bots (for botmonitor DM notifications)
+// GET /ended
+//
+// Returns bots that disconnected unexpectedly since the last poll.
+// Manual stops (/mcbot stop, /mcbot stopall) are excluded by botmanager.
+// The list is cleared after each call (consume-once).
+// ============================================================
+
+app.get("/ended", (req, res) => {
+  const bots = getAndClearRecentlyEnded();
+  if (bots.length > 0) {
+    console.log(`[server] 📥 GET /ended — returning ${bots.length} ended bot(s)`);
+  }
+  return res.status(200).json({ ok: true, count: bots.length, bots });
 });
 
 // ============================================================
