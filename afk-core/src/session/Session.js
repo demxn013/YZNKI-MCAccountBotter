@@ -69,8 +69,26 @@ class Session {
       this.connectedSince = new Date();
     });
 
-    client.on("keep_alive", () => {
+    // ── Keep-alive response ────────────────────────────────────────────────────
+    // minecraft-protocol does NOT automatically respond to keep_alive packets.
+    // The server expects the client to echo back the keep-alive ID within
+    // ~30 seconds, otherwise it kicks with "Timed out".
+    //
+    // Packet names used by the notchian server:
+    //   1.7.x  : keep_alive  { keepAliveId: number }
+    //   1.8-1.12: keep_alive { keepAliveId: number }
+    //   1.12.2+ : keep_alive { keepAliveId: Long (BigInt) }
+    //
+    // We echo back whatever we receive verbatim. If the write fails (e.g.
+    // session is already closing) we swallow the error silently.
+    // ──────────────────────────────────────────────────────────────────────────
+    client.on("keep_alive", (packet) => {
       this.lastKeepAliveAt = new Date();
+      try {
+        client.write("keep_alive", { keepAliveId: packet.keepAliveId });
+      } catch {
+        // Session is closing or already ended — ignore.
+      }
     });
 
     client.on("kick_disconnect", (packet) => {
@@ -169,4 +187,3 @@ class Session {
 module.exports = {
   Session,
 };
-
